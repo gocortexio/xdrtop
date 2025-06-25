@@ -47,39 +47,17 @@ impl App {
 
     pub fn set_incidents(&mut self, incidents: &[Incident]) {
         let mut sorted_incidents = incidents.to_vec();
-        // Sort by ID number (extract numeric part)
-        sorted_incidents.sort_by(|a, b| {
-            let a_id =
-                a.id.chars()
-                    .filter(|c| c.is_numeric())
-                    .collect::<String>()
-                    .parse::<u64>()
-                    .unwrap_or(0);
-            let b_id =
-                b.id.chars()
-                    .filter(|c| c.is_numeric())
-                    .collect::<String>()
-                    .parse::<u64>()
-                    .unwrap_or(0);
-            a_id.cmp(&b_id)
+        
+        // Optimized ID parsing with caching
+        sorted_incidents.sort_by_cached_key(|incident| {
+            incident.id.chars()
+                .filter(|c| c.is_ascii_digit())
+                .fold(0u64, |acc, c| acc * 10 + (c as u8 - b'0') as u64)
         });
 
         self.incidents = sorted_incidents;
         self.apply_filters();
         self.last_update = chrono::Utc::now();
-
-        // Track API call
-        let now = Utc::now();
-        self.api_calls.push_back(now);
-
-        // Keep only calls from last 60 seconds
-        while let Some(&front_time) = self.api_calls.front() {
-            if (now - front_time).num_seconds() > 60 {
-                self.api_calls.pop_front();
-            } else {
-                break;
-            }
-        }
 
         // Reset selection if we have fewer incidents than before
         let incident_count = self.filtered_incidents.len();
@@ -169,14 +147,10 @@ impl App {
         let now = chrono::Utc::now();
         self.api_calls.push_back(now);
 
-        // Keep only calls from the last 60 seconds
-        let cutoff = now - chrono::Duration::seconds(60);
-        while let Some(&front) = self.api_calls.front() {
-            if front < cutoff {
-                self.api_calls.pop_front();
-            } else {
-                break;
-            }
+        // Batch cleanup - only clean every 10 calls to reduce overhead
+        if self.api_calls.len() % 10 == 0 {
+            let cutoff = now - chrono::Duration::seconds(60);
+            self.api_calls.retain(|&time| time >= cutoff);
         }
     }
 
@@ -390,21 +364,9 @@ fn draw_incidents_table(f: &mut Frame, area: Rect, app: &mut App) {
     let header = Row::new(header_cells).height(1).bottom_margin(1);
 
     let rows = app.filtered_incidents.iter().map(|incident| {
-        let severity_style = match incident.severity.to_lowercase().as_str() {
-            "critical" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            "high" => Style::default().fg(Color::LightRed),
-            "medium" => Style::default().fg(Color::Yellow),
-            "low" => Style::default().fg(Color::Green),
-            _ => Style::default().fg(Color::White),
-        };
-
-        let status_style = match incident.status.to_lowercase().as_str() {
-            "new" => Style::default().fg(Color::LightBlue),
-            "under_investigation" => Style::default().fg(Color::Yellow),
-            "resolved" => Style::default().fg(Color::Green),
-            "closed" => Style::default().fg(Color::Gray),
-            _ => Style::default().fg(Color::White),
-        };
+        // Use optimized style functions to avoid repeated allocations
+        let severity_style = get_severity_style(&incident.severity);
+        let status_style = get_status_style(&incident.status);
 
         Row::new(vec![
             Cell::from(incident.id.chars().take(10).collect::<String>()),
@@ -461,7 +423,7 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
 fn draw_severity_summary(f: &mut Frame, area: Rect, app: &App) {
     let severity_counts = app.get_severity_counts();
     
-    // Debug: Show total incidents and actual severity values
+    // Show total incidents and actual severity values
     let total_incidents = app.incidents.len();
     let mut lines = vec![
         Line::from(vec![
@@ -473,7 +435,7 @@ fn draw_severity_summary(f: &mut Frame, area: Rect, app: &App) {
     // If we have incidents but no severity counts, show what severity values we actually have
     if total_incidents > 0 && severity_counts.is_empty() {
         lines.push(Line::from("No severity data found"));
-        // Show first few actual severity values for debugging
+        // Show first few actual severity values for troubleshooting
         for (i, incident) in app.incidents.iter().take(3).enumerate() {
             lines.push(Line::from(format!("#{}: '{}'", i+1, incident.severity)));
         }
@@ -806,12 +768,21 @@ fn draw_drill_down_status_bar(f: &mut Frame, area: Rect, _app: &App) {
 }
 
 fn get_severity_style(severity: &str) -> Style {
-    match severity.to_lowercase().as_str() {
-        "high" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        "medium" => Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
+    match severity.to_ascii_lowercase().as_str() {
+        "critical" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        "high" => Style::default().fg(Color::LightRed),
+        "medium" => Style::default().fg(Color::Yellow),
         "low" => Style::default().fg(Color::Green),
+        _ => Style::default().fg(Color::White),
+    }
+}
+
+fn get_status_style(status: &str) -> Style {
+    match status.to_ascii_lowercase().as_str() {
+        "new" => Style::default().fg(Color::LightBlue),
+        "under_investigation" => Style::default().fg(Color::Yellow),
+        "resolved" => Style::default().fg(Color::Green),
+        "closed" => Style::default().fg(Color::Gray),
         _ => Style::default().fg(Color::White),
     }
 }

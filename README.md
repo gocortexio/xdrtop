@@ -173,7 +173,7 @@ XDRTop provides comprehensive filtering capabilities:
 - **Visual Indicators**: Active filters shown in sidebar with case counts
 - **Dynamic Counts**: Header shows filtered/total case counts when filters are active
 
-## What's New in v1.0.4
+## What's New in v1.0.6
 
 ### Performance Enhancements
 - **Adaptive Polling System**: Intelligent API polling that adjusts intervals (15s-5min) based on data changes
@@ -295,7 +295,7 @@ To check the current version:
 ./xdrtop --version
 ```
 
-Current release: **v1.0.4** with enhanced performance and accurate issue counting.
+Current release: **v1.0.6** with enhanced performance and accurate issue counting.
 
 ## Development
 
@@ -303,7 +303,7 @@ Current release: **v1.0.4** with enhanced performance and accurate issue countin
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/xdrtop.git
+git clone https://github.com/gocortexio/xdrtop.git
 cd xdrtop
 
 # Build and run

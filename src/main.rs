@@ -164,8 +164,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                 }
             }
 
-            _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                // Check for user input
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                // Check for user input with reduced polling for better responsiveness
                 if event::poll(Duration::from_millis(0))? {
                     if let Event::Key(key) = event::read()? {
                         match key.code {

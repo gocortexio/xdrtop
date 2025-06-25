@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use dirs::home_dir;
 use serde::{Deserialize, Serialize};
-use std::fs;
+
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -22,7 +22,8 @@ impl Config {
             ));
         }
 
-        let content = fs::read_to_string(config_path)?;
+        // Use async file I/O for better performance
+        let content = tokio::fs::read_to_string(config_path).await?;
         let config: Config = serde_json::from_str(&content)?;
         Ok(config)
     }
@@ -32,11 +33,11 @@ impl Config {
 
         // Create directory if it doesn't exist
         if let Some(parent) = config_path.parent() {
-            fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
 
         let content = serde_json::to_string_pretty(self)?;
-        fs::write(config_path, content)?;
+        tokio::fs::write(config_path, content).await?;
         Ok(())
     }
 }
