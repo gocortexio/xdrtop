@@ -5,7 +5,7 @@ A high-performance Rust CLI monitoring tool for Cortex XDR, delivering real-time
 ## Features
 
 ### Core Monitoring
-- **Real-time Case Monitoring**: Polls Cortex XDR API every 30 seconds for the latest case data
+- **Adaptive Polling**: Intelligent polling system (15s-5min intervals) with ETag caching for optimal performance
 - **Interactive Terminal UI**: htop-style interface with keyboard navigation and drill-down capabilities
 - **Advanced Filtering**: Filter cases by severity levels and status with keyboard shortcuts
 - **Detailed Case View**: Press Enter to view comprehensive case details including associated issues
@@ -14,7 +14,7 @@ A high-performance Rust CLI monitoring tool for Cortex XDR, delivering real-time
 
 ### User Interface
 - **Responsive Design**: Modern terminal interface with colour-coded severity and status indicators
-- **Real-time Statistics**: Live counts of cases by severity and status
+- **Real-time Statistics**: Live counts of cases by severity and status with accurate issue counting
 - **Filter Status Display**: Visual indication of active filters and case counts
 - **Status Tracking**: Real-time status updates and error handling with visual feedback
 - **Intuitive Controls**: Comprehensive keyboard shortcuts for all functionality
@@ -72,7 +72,7 @@ Run the following command to set up your API credentials:
 You'll be prompted to enter:
 - **API Key ID**: Your Cortex XDR API key identifier
 - **API Key Secret**: Your Cortex XDR API secret key
-- **Tenant URL**: Your Cortex XDR tenant URL (e.g., `https://api-your-tenant.xdr.us.paloaltonetworks.com`)
+- **Tenant URL**: Your Cortex XDR tenant URL (e.g., `https://api-your-tenant.xdr.au.paloaltonetworks.com`)
 
 ### Configuration File
 
@@ -82,7 +82,7 @@ Credentials are stored securely in `~/.xdrtop/config.json` with the following st
 {
   "api_key_id": "your-api-key-id",
   "api_key_secret": "your-api-key-secret",
-  "tenant_url": "https://api-your-tenant.xdr.us.paloaltonetworks.com"
+  "tenant_url": "https://api-your-tenant.xdr.au.paloaltonetworks.com"
 }
 ```
 
@@ -173,6 +173,21 @@ XDRTop provides comprehensive filtering capabilities:
 - **Visual Indicators**: Active filters shown in sidebar with case counts
 - **Dynamic Counts**: Header shows filtered/total case counts when filters are active
 
+## What's New in v1.0.4
+
+### Performance Enhancements
+- **Adaptive Polling System**: Intelligent API polling that adjusts intervals (15s-5min) based on data changes
+- **HTTP ETag Caching**: Reduces unnecessary API calls when no new data is available
+- **Enhanced Error Handling**: Improved resilience with better rate limiting and error recovery
+
+### Bug Fixes
+- **Accurate Issue Counting**: Fixed inconsistency where main table and drill-down views showed different issue counts
+- **Data Consistency**: Both views now display actual issue array lengths for reliable information
+
+### Configuration Updates
+- **Australian Endpoints**: All documentation and examples now use Australian Cortex XDR endpoints (.au domain)
+- **Localisation**: Consistent Australian English spelling throughout the application
+
 ## API Integration
 
 ### Endpoints Used
@@ -215,9 +230,10 @@ XDRTop implements intelligent rate limiting:
 
 - **Memory Efficient**: Minimal memory footprint with efficient data structures
 - **CPU Optimised**: Async operations prevent UI blocking and maintain responsiveness
-- **Network Efficient**: Intelligent polling reduces bandwidth usage
+- **Network Efficient**: Adaptive polling with ETag caching reduces bandwidth usage
 - **Terminal Responsive**: Smooth interface updates with optimised rendering
 - **Filter Performance**: Instant filtering with no API calls required
+- **Real-time Updates**: Countdown timer shows next poll time and adaptive mode status
 
 ## Security Considerations
 
@@ -271,11 +287,26 @@ RUST_LOG=debug ./xdrtop
 
 Available log levels: `error`, `warn`, `info`, `debug`, `trace`
 
-## Development
+### Version Information
 
-### Building for Development
+To check the current version:
 
 ```bash
+./xdrtop --version
+```
+
+Current release: **v1.0.4** with enhanced performance and accurate issue counting.
+
+## Development
+
+### Building from Source
+
+```bash
+# Clone the repository
+git clone https://github.com/yourusername/xdrtop.git
+cd xdrtop
+
+# Build and run
 cargo run
 ```
 

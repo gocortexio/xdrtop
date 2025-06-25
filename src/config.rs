@@ -56,7 +56,7 @@ pub async fn init_config() -> Result<()> {
     io::stdin().read_line(&mut api_key_secret)?;
     let api_key_secret = api_key_secret.trim().to_string();
 
-    print!("Enter Tenant URL (e.g., https://api-your-tenant.xdr.us.paloaltonetworks.com): ");
+    print!("Enter Tenant URL (e.g., https://api-your-tenant.xdr.au.paloaltonetworks.com): ");
     io::stdout().flush()?;
     let mut tenant_url = String::new();
     io::stdin().read_line(&mut tenant_url)?;

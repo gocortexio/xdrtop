@@ -411,7 +411,7 @@ fn draw_incidents_table(f: &mut Frame, area: Rect, app: &mut App) {
             Cell::from(incident.severity.clone()).style(severity_style),
             Cell::from(incident.status.clone()).style(status_style),
             Cell::from(incident.truncated_description(80)),
-            Cell::from(incident.alert_count.to_string()),
+            Cell::from(incident.alerts.len().to_string()),
             Cell::from(incident.creation_time.to_rfc3339()),
         ])
     });

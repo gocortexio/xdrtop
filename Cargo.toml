@@ -1,6 +1,6 @@
 [package]
 name = "xdrtop"
-version = "1.0.2"
+version = "1.0.4"
 edition = "2021"
 authors = ["XDRTop Team"]
 description = "High-performance Rust CLI monitoring tool for Cortex XDR with real-time incident tracking"
@@ -12,7 +12,7 @@ categories = ["command-line-utilities", "development-tools"]
 
 [package.metadata.deb]
 maintainer = "XDRTop Team <support@xdrtop.dev>"
-copyright = "2024, XDRTop Team"
+copyright = "2025, XDRTop Team"
 license-file = ["LICENSE", "4"]
 extended-description = """\
 XDRTop is a high-performance terminal-based monitoring tool for Cortex XDR \
