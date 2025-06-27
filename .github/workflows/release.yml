@@ -29,6 +29,10 @@ jobs:
             target: aarch64-apple-darwin
             name: xdrtop-macos-aarch64
             package_type: tar
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            name: xdrtop-windows-x86_64
+            package_type: zip
 
     runs-on: ${{ matrix.os }}
 
@@ -80,6 +84,14 @@ jobs:
         tar -czf ${{ matrix.name }}.tar.gz ${{ matrix.name }}
         rm ${{ matrix.name }}
 
+    - name: Create Windows ZIP archive
+      if: matrix.package_type == 'zip'
+      run: |
+        cp target/${{ matrix.target }}/release/xdrtop.exe release/${{ matrix.name }}.exe
+        cd release
+        7z a ${{ matrix.name }}.zip ${{ matrix.name }}.exe
+        rm ${{ matrix.name }}.exe
+
     - name: Upload artifacts
       uses: actions/upload-artifact@v4
       with:
@@ -105,6 +117,7 @@ jobs:
         mkdir -p release-files
         find artifacts -name "*.tar.gz" -exec cp {} release-files/ \;
         find artifacts -name "*.deb" -exec cp {} release-files/ \;
+        find artifacts -name "*.zip" -exec cp {} release-files/ \;
         ls -la release-files/
 
     - name: Create release
@@ -115,7 +128,7 @@ jobs:
         draft: false
         prerelease: false
         body: |
-          ## XDRTop v1.0.2 Release
+          ## XDRTop ${{ github.ref_name }} Release
           
           High-performance Rust CLI monitoring tool for Cortex XDR with real-time case tracking.
           
@@ -123,6 +136,7 @@ jobs:
           - **Linux (Debian/Ubuntu)**: Download the `.deb` package
           - **macOS (Intel)**: Download `xdrtop-macos-x86_64.tar.gz`
           - **macOS (Apple Silicon)**: Download `xdrtop-macos-aarch64.tar.gz`
+          - **Windows**: Download `xdrtop-windows-x86_64.zip`
           
           ### Installation
           
@@ -137,13 +151,20 @@ jobs:
           sudo mv xdrtop-macos-* /usr/local/bin/xdrtop
           ```
           
+          #### Windows
+          ```powershell
+          # Extract ZIP and add to PATH
+          Expand-Archive xdrtop-windows-x86_64.zip -DestinationPath C:\Tools\xdrtop
+          # Add C:\Tools\xdrtop to your PATH environment variable
+          ```
+          
           ### Configuration
           Create your configuration file at `~/.xdrtop/config.json`:
           ```json
           {
             "api_key_id": "your-api-key-id",
             "api_key_secret": "your-api-key-secret",
-            "tenant_url": "https://api-your-tenant.xdr.us.paloaltonetworks.com"
+            "tenant_url": "https://api-your-tenant.xdr.au.paloaltonetworks.com"
           }
           ```
       env:
