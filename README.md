@@ -10,7 +10,7 @@ A high-performance Rust CLI monitoring tool for Cortex XDR, delivering real-time
 - **Advanced Filtering**: Filter cases by severity levels and status with keyboard shortcuts
 - **Detailed Case View**: Press Enter to view comprehensive case details including associated issues
 - **Rate Limiting**: Built-in exponential backoff to handle API rate limits gracefully
-- **Secure Configuration**: Stores encrypted API credentials in `~/.xdrtop/config.json`
+- **Secure Configuration**: Stores encrypted API credentials in platform-specific user directory
 
 ### User Interface
 - **Responsive Design**: Modern terminal interface with colour-coded severity and status indicators
@@ -42,6 +42,12 @@ A high-performance Rust CLI monitoring tool for Cortex XDR, delivering real-time
 - Rust 1.70 or later
 - Cortex XDR API credentials (API Key ID and Secret)
 - Network access to your Cortex XDR tenant
+
+#### Windows Requirements
+- **Microsoft Visual C++ Redistributable**: Required to resolve vcruntime140.dll errors
+  - Download from: https://aka.ms/vs/17/release/vc_redist.x64.exe
+  - Install both x64 and x86 versions if unsure about your system architecture
+- **Windows 10/11**: Recommended for best compatibility
 
 ### Building from Source
 
@@ -76,7 +82,11 @@ You'll be prompted to enter:
 
 ### Configuration File
 
-Credentials are stored securely in `~/.xdrtop/config.json` with the following structure:
+Credentials are stored securely in a platform-specific location:
+- **Windows**: `%USERPROFILE%\.xdrtop\config.json` (e.g., `C:\Users\username\.xdrtop\config.json`)
+- **Linux/macOS**: `~/.xdrtop/config.json`
+
+The configuration file has the following structure:
 
 ```json
 {
@@ -173,21 +183,6 @@ XDRTop provides comprehensive filtering capabilities:
 - **Visual Indicators**: Active filters shown in sidebar with case counts
 - **Dynamic Counts**: Header shows filtered/total case counts when filters are active
 
-## What's New in v1.0.6
-
-### Performance Enhancements
-- **Adaptive Polling System**: Intelligent API polling that adjusts intervals (15s-5min) based on data changes
-- **HTTP ETag Caching**: Reduces unnecessary API calls when no new data is available
-- **Enhanced Error Handling**: Improved resilience with better rate limiting and error recovery
-
-### Bug Fixes
-- **Accurate Issue Counting**: Fixed inconsistency where main table and drill-down views showed different issue counts
-- **Data Consistency**: Both views now display actual issue array lengths for reliable information
-
-### Configuration Updates
-- **Australian Endpoints**: All documentation and examples now use Australian Cortex XDR endpoints (.au domain)
-- **Localisation**: Consistent Australian English spelling throughout the application
-
 ## API Integration
 
 ### Endpoints Used
@@ -253,25 +248,40 @@ XDRTop implements intelligent rate limiting:
    ```
    **Solution**: Run `./xdrtop --init-config` to set up credentials
 
-2. **API Connection Issues**
+2. **Windows vcruntime140.dll Error**
+   ```
+   Error: The code execution cannot proceed because vcruntime140.dll was not found
+   ```
+   **Solution**: Install Microsoft Visual C++ Redistributable:
+   - Download: https://aka.ms/vs/17/release/vc_redist.x64.exe
+   - Run installer as administrator
+   - Restart terminal/command prompt after installation
+
+3. **Windows Application Stability**
+   If the Windows version starts in case details mode or crashes on Escape:
+   - This issue has been fixed in v1.0.11
+   - The application now properly initialises in main table view
+   - Escape key handling is more robust and won't cause crashes
+
+3. **API Connection Issues**
    ```
    Error: builder error: relative URL without a base
    ```
    **Solution**: Verify tenant URL includes protocol (https://) and is correctly formatted
 
-3. **Authentication Failures**
+4. **Authentication Failures**
    ```
    Error: Authentication failed
    ```
    **Solution**: Verify API key ID and secret are correct and have proper permissions
 
-4. **Rate Limiting**
+5. **Rate Limiting**
    ```
    Warning: Rate limit exceeded, backing off...
    ```
    **Solution**: XDRTop automatically handles this with exponential backoff
 
-5. **Network Connectivity**
+6. **Network Connectivity**
    ```
    Error: Failed to connect to API
    ```
@@ -295,7 +305,7 @@ To check the current version:
 ./xdrtop --version
 ```
 
-Current release: **v1.0.6** with enhanced performance and accurate issue counting.
+Current release: **v1.0.11** with Windows stability fixes and cross-platform compatibility.
 
 ## Development
 

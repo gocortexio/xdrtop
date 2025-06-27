@@ -35,6 +35,9 @@ struct ApiIncident {
     severity: String,
     description: Option<String>,
     creation_time: u64,
+    modification_time: Option<u64>,
+    last_update_time: Option<u64>,
+    updated_time: Option<u64>,
     alert_count: Option<u32>,
     alerts: Option<Vec<ApiAlert>>,
     hosts: Option<Vec<String>>,
@@ -60,7 +63,7 @@ struct ApiAlert {
 pub struct XdrClient {
     client: Client,
     config: Config,
-    poll_interval: Arc<AtomicU64>, // Store as milliseconds
+
     last_response_etag: Arc<std::sync::Mutex<Option<String>>>,
     last_successful_poll: Arc<std::sync::Mutex<Option<Instant>>>,
     consecutive_errors: Arc<AtomicU64>,
@@ -71,7 +74,6 @@ impl XdrClient {
         Self {
             client: Client::new(),
             config,
-            poll_interval: Arc::new(AtomicU64::new(30000)), // 30 seconds in ms
             last_response_etag: Arc::new(std::sync::Mutex::new(None)),
             last_successful_poll: Arc::new(std::sync::Mutex::new(None)),
             consecutive_errors: Arc::new(AtomicU64::new(0)),
@@ -206,9 +208,7 @@ impl XdrClient {
         Duration::from_millis(interval_ms)
     }
 
-    pub fn reset_poll_interval(&self) {
-        self.consecutive_errors.store(0, Ordering::Relaxed);
-    }
+
 
     pub fn get_poll_interval(&self) -> Duration {
         self.get_adaptive_poll_interval()
@@ -221,6 +221,12 @@ impl XdrClient {
     fn convert_incident(&self, api_incident: ApiIncident) -> Incident {
         let creation_time = DateTime::from_timestamp(api_incident.creation_time as i64 / 1000, 0)
             .unwrap_or_else(Utc::now);
+
+        // Check for update time fields in order of preference
+        let last_updated = api_incident.modification_time
+            .or(api_incident.last_update_time)
+            .or(api_incident.updated_time)
+            .and_then(|timestamp| DateTime::from_timestamp(timestamp as i64 / 1000, 0));
 
         // For debugging: check if alerts are provided in API response
         let alerts: Vec<Alert> = if let Some(api_alerts) = api_incident.alerts.clone() {
@@ -258,7 +264,8 @@ impl XdrClient {
                 .description
                 .unwrap_or_else(|| "No description".to_string()),
             creation_time,
-            alert_count: alerts.len() as u32,
+            last_updated,
+
             alerts,
         }
     }

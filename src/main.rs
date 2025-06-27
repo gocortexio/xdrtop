@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    event::{self, Event, KeyCode},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -66,23 +66,22 @@ async fn main() -> Result<()> {
     // Set tenant URL for display
     app.set_tenant_url(config.tenant_url);
 
-    // Setup terminal
+    // Setup terminal - disable mouse capture to allow text selection
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?; // Removed EnableMouseCapture
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     // Main application loop
     let result = run_app(&mut terminal, &mut app, &client, &mut incident_store).await;
 
-    // Restore terminal
+    // Restore terminal - no need to disable mouse capture since we didn't enable it
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+        LeaveAlternateScreen
+    )?; // Removed DisableMouseCapture
     terminal.show_cursor()?;
 
     if let Err(err) = result {
@@ -104,6 +103,9 @@ async fn run_app<B: ratatui::backend::Backend>(
     
     // Set initial next poll time
     app.set_next_poll_time(last_poll_duration);
+    
+    // Force initial render to ensure app starts in main view
+    terminal.draw(|f| ui::draw(f, app))?;
 
     loop {
         tokio::select! {
@@ -180,7 +182,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 }
                             }
                             KeyCode::Enter => {
-                                if !app.is_drill_down_mode() {
+                                if !app.is_drill_down_mode() && !app.filtered_incidents.is_empty() {
                                     app.enter_drill_down();
                                 }
                             }
@@ -224,6 +226,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     app.clear_filters();
                                 }
                             }
+
                             _ => {}
                         }
                     }

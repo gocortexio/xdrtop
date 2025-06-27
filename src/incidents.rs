@@ -19,7 +19,8 @@ pub struct Incident {
     pub severity: String,
     pub description: String,
     pub creation_time: DateTime<Utc>,
-    pub alert_count: u32,
+    pub last_updated: Option<DateTime<Utc>>,
+
     pub alerts: Vec<Alert>,
 }
 

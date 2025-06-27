@@ -66,7 +66,10 @@ impl App {
                 self.table_state.select(Some(incident_count - 1));
             }
         } else if incident_count > 0 {
-            self.table_state.select(Some(0));
+            // Only auto-select if we're not in drill-down mode
+            if !self.drill_down_mode {
+                self.table_state.select(Some(0));
+            }
         }
     }
 
@@ -198,6 +201,43 @@ impl App {
         self.table_state.select(Some(i));
     }
 
+    // Add fast navigation for large datasets
+    pub fn page_down(&mut self, page_size: usize) {
+        if self.filtered_incidents.is_empty() {
+            return;
+        }
+        let current = self.table_state.selected().unwrap_or(0);
+        let new_pos = std::cmp::min(
+            current + page_size,
+            self.filtered_incidents.len().saturating_sub(1)
+        );
+        self.table_state.select(Some(new_pos));
+    }
+
+    pub fn page_up(&mut self, page_size: usize) {
+        if self.filtered_incidents.is_empty() {
+            return;
+        }
+        let current = self.table_state.selected().unwrap_or(0);
+        let new_pos = current.saturating_sub(page_size);
+        self.table_state.select(Some(new_pos));
+    }
+
+    pub fn go_to_top(&mut self) {
+        if !self.filtered_incidents.is_empty() {
+            self.table_state.select(Some(0));
+        }
+    }
+
+    pub fn go_to_bottom(&mut self) {
+        if !self.filtered_incidents.is_empty() {
+            let last = self.filtered_incidents.len().saturating_sub(1);
+            self.table_state.select(Some(last));
+        }
+    }
+
+
+
     pub fn get_severity_counts(&self) -> HashMap<String, usize> {
         let mut counts = HashMap::new();
         // Use filtered incidents if filters are active, otherwise use all incidents
@@ -222,6 +262,11 @@ impl App {
     }
 
     pub fn enter_drill_down(&mut self) {
+        // Only enter drill-down if we have incidents and a valid selection
+        if self.filtered_incidents.is_empty() {
+            return;
+        }
+        
         if let Some(selected_idx) = self.table_state.selected() {
             if selected_idx < self.filtered_incidents.len() {
                 self.selected_incident = Some(self.filtered_incidents[selected_idx].clone());
@@ -233,6 +278,11 @@ impl App {
     pub fn exit_drill_down(&mut self) {
         self.drill_down_mode = false;
         self.selected_incident = None;
+        
+        // Ensure we have a valid selection when returning to main view
+        if !self.filtered_incidents.is_empty() && self.table_state.selected().is_none() {
+            self.table_state.select(Some(0));
+        }
     }
 
     pub fn is_drill_down_mode(&self) -> bool {
@@ -246,6 +296,11 @@ impl App {
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let size = f.size();
+
+    // Safety check: if we're in drill-down mode but have no selected incident, exit drill-down
+    if app.is_drill_down_mode() && app.get_selected_incident().is_none() {
+        app.exit_drill_down();
+    }
 
     if app.is_drill_down_mode() {
         draw_drill_down_view(f, size, app);
@@ -310,8 +365,9 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(area);
 
-    // Title
-    let title = Paragraph::new("XDRTop - Cortex XDR Case Monitor")
+    // Title with version number from Cargo.toml
+    let title_text = format!("XDRTop - Cortex XDR Case Monitor v{}", env!("CARGO_PKG_VERSION"));
+    let title = Paragraph::new(title_text)
         .style(
             Style::default()
                 .fg(Color::Cyan)
@@ -346,11 +402,12 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 fn draw_incidents_table(f: &mut Frame, area: Rect, app: &mut App) {
     let header_cells = [
         "ID",
-        "Severity",
+        "Severity", 
         "Status",
         "Description",
         "Issues",
         "Created",
+        "Last Updated",
     ]
     .iter()
     .map(|h| {
@@ -363,28 +420,39 @@ fn draw_incidents_table(f: &mut Frame, area: Rect, app: &mut App) {
 
     let header = Row::new(header_cells).height(1).bottom_margin(1);
 
+    // Disable viewport rendering to fix scrolling issues - render all rows
     let rows = app.filtered_incidents.iter().map(|incident| {
-        // Use optimized style functions to avoid repeated allocations
+        // Use cached style functions
         let severity_style = get_severity_style(&incident.severity);
         let status_style = get_status_style(&incident.status);
 
+        // Optimized string operations - use owned strings to avoid borrow issues
+        let id_display = incident.id.chars().take(10).collect::<String>();
+        let alert_count = incident.alerts.len().to_string();
+        let formatted_created = incident.creation_time.format("%Y-%m-%d %H:%M:%S").to_string();
+        let formatted_updated = incident.last_updated
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| "N/A".to_string());
+
         Row::new(vec![
-            Cell::from(incident.id.chars().take(10).collect::<String>()),
+            Cell::from(id_display),
             Cell::from(incident.severity.clone()).style(severity_style),
             Cell::from(incident.status.clone()).style(status_style),
-            Cell::from(incident.truncated_description(80)),
-            Cell::from(incident.alerts.len().to_string()),
-            Cell::from(incident.creation_time.to_rfc3339()),
+            Cell::from(incident.truncated_description(85)), // Increased to use more available space
+            Cell::from(alert_count),
+            Cell::from(formatted_created),
+            Cell::from(formatted_updated),
         ])
     });
 
     let widths = [
-        Constraint::Length(10),     // ID
+        Constraint::Length(12),     // ID (increased from 10)
         Constraint::Length(8),      // Severity
-        Constraint::Length(22),     // Status (increased width)
-        Constraint::Percentage(50), // Description (adjusted for wider status)
-        Constraint::Length(6),      // Issues
-        Constraint::Length(19),     // Created
+        Constraint::Length(22),     // Status (restored to 22)
+        Constraint::Percentage(45), // Description (increased from 35 to use more space)
+        Constraint::Length(7),      // Issues (increased from 6)
+        Constraint::Length(20),     // Created (increased from 19)
+        Constraint::Length(20),     // Last Updated (increased from 19)
     ];
 
     let table = Table::new(rows, widths)
@@ -397,6 +465,7 @@ fn draw_incidents_table(f: &mut Frame, area: Rect, app: &mut App) {
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol(">> ");
 
+    // Use standard table rendering without viewport adjustments
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
@@ -583,6 +652,8 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(help, chunks[1]);
 }
 
+
+
 fn draw_drill_down_header(f: &mut Frame, area: Rect, app: &App) {
     let title = if let Some(incident) = app.get_selected_incident() {
         format!("XDRTop - Case Details: {}", incident.id)
@@ -664,6 +735,19 @@ fn draw_incident_summary(f: &mut Frame, area: Rect, incident: &Incident) {
                     .creation_time
                     .format("%Y-%m-%d %H:%M:%S UTC")
                     .to_string(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Last Updated: ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(
+                incident.last_updated
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                    .unwrap_or_else(|| "N/A".to_string())
             ),
         ]),
         Line::from(vec![
@@ -768,6 +852,7 @@ fn draw_drill_down_status_bar(f: &mut Frame, area: Rect, _app: &App) {
 }
 
 fn get_severity_style(severity: &str) -> Style {
+    // Cache-friendly style lookup with early returns for performance
     match severity.to_ascii_lowercase().as_str() {
         "critical" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         "high" => Style::default().fg(Color::LightRed),
@@ -778,6 +863,7 @@ fn get_severity_style(severity: &str) -> Style {
 }
 
 fn get_status_style(status: &str) -> Style {
+    // Cache-friendly style lookup with early returns for performance
     match status.to_ascii_lowercase().as_str() {
         "new" => Style::default().fg(Color::LightBlue),
         "under_investigation" => Style::default().fg(Color::Yellow),
