@@ -8,7 +8,7 @@ use ratatui::{
 };
 use std::collections::{HashMap, VecDeque};
 
-use crate::incidents::Incident;
+use crate::incidents::{Incident, Alert};
 
 pub struct App {
     pub incidents: Vec<Incident>,
@@ -24,6 +24,8 @@ pub struct App {
     pub api_calls: VecDeque<DateTime<Utc>>,
     pub next_poll_time: Option<DateTime<Utc>>,
     pub tenant_url: Option<String>,
+    pub loading_large_dataset: bool,
+    pub last_key_time: std::time::Instant,
 }
 
 impl App {
@@ -32,7 +34,7 @@ impl App {
             incidents: Vec::new(),
             filtered_incidents: Vec::new(),
             table_state: TableState::default(),
-            status_message: "Initialising...".to_string(),
+            status_message: "".to_string(),
             is_error: false,
             last_update: chrono::Utc::now(),
             drill_down_mode: false,
@@ -42,22 +44,41 @@ impl App {
             api_calls: VecDeque::new(),
             next_poll_time: None,
             tenant_url: None,
+            loading_large_dataset: false,
+            last_key_time: std::time::Instant::now(),
         }
     }
 
     pub fn set_incidents(&mut self, incidents: &[Incident]) {
-        let mut sorted_incidents = incidents.to_vec();
+        // Handle large datasets (>500 cases) with optimised loading
+        if incidents.len() > 500 {
+            self.loading_large_dataset = true;
+            self.status_message = format!("Loading {} cases...", incidents.len());
+        }
         
-        // Optimized ID parsing with caching
-        sorted_incidents.sort_by_cached_key(|incident| {
-            incident.id.chars()
-                .filter(|c| c.is_ascii_digit())
-                .fold(0u64, |acc, c| acc * 10 + (c as u8 - b'0') as u64)
-        });
-
-        self.incidents = sorted_incidents;
+        // Skip redundant operations if incidents haven't changed
+        if incidents.len() == self.incidents.len() && 
+           incidents.iter().zip(&self.incidents).all(|(a, b)| a.id == b.id) {
+            self.loading_large_dataset = false;
+            return;
+        }
+        
+        // Pre-allocate vectors for large datasets to avoid reallocations
+        if incidents.len() > self.incidents.capacity() {
+            self.incidents.reserve(incidents.len());
+        }
+        
+        // Memory optimization: avoid unnecessary copying by using clone_from when possible
+        if self.incidents.len() == incidents.len() {
+            // Reuse existing capacity and update in-place
+            self.incidents.clone_from_slice(incidents);
+        } else {
+            // Only allocate new vector when size changes
+            self.incidents = incidents.to_vec();
+        }
         self.apply_filters();
         self.last_update = chrono::Utc::now();
+        self.loading_large_dataset = false;
 
         // Reset selection if we have fewer incidents than before
         let incident_count = self.filtered_incidents.len();
@@ -65,33 +86,52 @@ impl App {
             if selected >= incident_count && incident_count > 0 {
                 self.table_state.select(Some(incident_count - 1));
             }
-        } else if incident_count > 0 {
-            // Only auto-select if we're not in drill-down mode
-            if !self.drill_down_mode {
-                self.table_state.select(Some(0));
-            }
+        } else if incident_count > 0 && !self.drill_down_mode {
+            // Only auto-select on first load when we have no selection and not in drill-down mode
+            // Don't auto-select on Windows to prevent auto-entering case details
+            #[cfg(not(target_os = "windows"))]
+            self.table_state.select(Some(0));
         }
     }
 
     fn apply_filters(&mut self) {
-        self.filtered_incidents = self
-            .incidents
-            .iter()
-            .filter(|incident| {
-                if let Some(ref severity_filter) = self.severity_filter {
-                    if !incident.severity.eq_ignore_ascii_case(severity_filter) {
-                        return false;
-                    }
+        // Memory optimization: avoid unnecessary cloning and allocations
+        if self.severity_filter.is_none() && self.status_filter.is_none() {
+            // No filters active - avoid cloning when possible
+            if self.filtered_incidents.len() != self.incidents.len() {
+                self.filtered_incidents.clone_from(&self.incidents);
+            }
+            return;
+        }
+        
+        // Clear and pre-allocate with estimated capacity to avoid reallocations
+        self.filtered_incidents.clear();
+        let estimated_capacity = self.incidents.len() / 2; // Conservative estimate
+        if self.filtered_incidents.capacity() < estimated_capacity {
+            self.filtered_incidents.reserve(estimated_capacity);
+        }
+        
+        for incident in &self.incidents {
+            let mut include = true;
+            
+            if let Some(ref severity_filter) = self.severity_filter {
+                if !incident.severity.eq_ignore_ascii_case(severity_filter) {
+                    include = false;
                 }
+            }
+            
+            if include {
                 if let Some(ref status_filter) = self.status_filter {
                     if !incident.status.eq_ignore_ascii_case(status_filter) {
-                        return false;
+                        include = false;
                     }
                 }
-                true
-            })
-            .cloned()
-            .collect();
+            }
+            
+            if include {
+                self.filtered_incidents.push(incident.clone());
+            }
+        }
     }
 
     pub fn toggle_severity_filter(&mut self, severity: String) {
@@ -145,13 +185,36 @@ impl App {
         self.status_message = message;
         self.is_error = is_error;
     }
+    
+    pub fn get_filter_settings(&self) -> (Option<String>, Option<String>) {
+        (self.severity_filter.clone(), self.status_filter.clone())
+    }
+    
+    pub fn set_filter_settings(&mut self, severity_filter: Option<String>, status_filter: Option<String>) {
+        self.severity_filter = severity_filter;
+        self.status_filter = status_filter;
+        self.apply_filters();
+    }
 
     pub fn record_api_call(&mut self) {
         let now = chrono::Utc::now();
+        
+        // Prevent memory leak by maintaining a maximum size
+        const MAX_API_CALLS: usize = 120; // 2 minutes at 1 call per second
+        const CLEANUP_THRESHOLD: usize = 100;
+        
         self.api_calls.push_back(now);
 
-        // Batch cleanup - only clean every 10 calls to reduce overhead
-        if self.api_calls.len() % 10 == 0 {
+        // More aggressive cleanup to prevent memory growth
+        if self.api_calls.len() >= MAX_API_CALLS {
+            // Remove oldest entries first to maintain fixed size
+            while self.api_calls.len() > CLEANUP_THRESHOLD {
+                self.api_calls.pop_front();
+            }
+        }
+        
+        // Additional time-based cleanup every 5 calls to remove stale entries
+        if self.api_calls.len() % 5 == 0 {
             let cutoff = now - chrono::Duration::seconds(60);
             self.api_calls.retain(|&time| time >= cutoff);
         }
@@ -163,6 +226,36 @@ impl App {
     
     pub fn set_tenant_url(&mut self, url: String) {
         self.tenant_url = Some(url);
+    }
+
+    /// Memory optimization: periodically clean up old data to prevent memory growth
+    /// Check if enough time has passed since last key event to prevent double-key issues on Windows
+    pub fn should_process_key(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.last_key_time);
+        
+        // Require at least 100ms between key events to debounce (increased for Windows stability)
+        if elapsed.as_millis() >= 100 {
+            self.last_key_time = now;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn cleanup_memory(&mut self) {
+        // Clean old API call records
+        let cutoff = chrono::Utc::now() - chrono::Duration::seconds(120);
+        self.api_calls.retain(|&time| time >= cutoff);
+        
+        // Shrink capacity if vectors are oversized (more than 2x current size)
+        if self.incidents.capacity() > self.incidents.len() * 2 && self.incidents.capacity() > 100 {
+            self.incidents.shrink_to_fit();
+        }
+        
+        if self.filtered_incidents.capacity() > self.filtered_incidents.len() * 2 && self.filtered_incidents.capacity() > 100 {
+            self.filtered_incidents.shrink_to_fit();
+        }
     }
 
     pub fn next(&mut self) {
@@ -201,40 +294,7 @@ impl App {
         self.table_state.select(Some(i));
     }
 
-    // Add fast navigation for large datasets
-    pub fn page_down(&mut self, page_size: usize) {
-        if self.filtered_incidents.is_empty() {
-            return;
-        }
-        let current = self.table_state.selected().unwrap_or(0);
-        let new_pos = std::cmp::min(
-            current + page_size,
-            self.filtered_incidents.len().saturating_sub(1)
-        );
-        self.table_state.select(Some(new_pos));
-    }
 
-    pub fn page_up(&mut self, page_size: usize) {
-        if self.filtered_incidents.is_empty() {
-            return;
-        }
-        let current = self.table_state.selected().unwrap_or(0);
-        let new_pos = current.saturating_sub(page_size);
-        self.table_state.select(Some(new_pos));
-    }
-
-    pub fn go_to_top(&mut self) {
-        if !self.filtered_incidents.is_empty() {
-            self.table_state.select(Some(0));
-        }
-    }
-
-    pub fn go_to_bottom(&mut self) {
-        if !self.filtered_incidents.is_empty() {
-            let last = self.filtered_incidents.len().saturating_sub(1);
-            self.table_state.select(Some(last));
-        }
-    }
 
 
 
@@ -253,13 +313,7 @@ impl App {
         counts
     }
 
-    fn get_status_counts(&self) -> HashMap<String, usize> {
-        let mut counts = HashMap::new();
-        for incident in &self.incidents {
-            *counts.entry(incident.status.clone()).or_insert(0) += 1;
-        }
-        counts
-    }
+
 
     pub fn enter_drill_down(&mut self) {
         // Only enter drill-down if we have incidents and a valid selection
@@ -269,7 +323,9 @@ impl App {
         
         if let Some(selected_idx) = self.table_state.selected() {
             if selected_idx < self.filtered_incidents.len() {
-                self.selected_incident = Some(self.filtered_incidents[selected_idx].clone());
+                let incident = &self.filtered_incidents[selected_idx];
+
+                self.selected_incident = Some(incident.clone());
                 self.drill_down_mode = true;
             }
         }
@@ -291,6 +347,21 @@ impl App {
 
     pub fn get_selected_incident(&self) -> Option<&Incident> {
         self.selected_incident.as_ref()
+    }
+    
+    pub fn update_selected_incident_alerts(&mut self, alerts: Vec<Alert>) {
+        if let Some(ref mut incident) = self.selected_incident {
+            // Only update alerts, preserve the original alert_count from the main incidents API
+            // The main incidents API has the authoritative count, individual alerts API may be incomplete
+            incident.alerts = alerts;
+        }
+    }
+    
+    pub fn prepare_for_drill_down(&mut self, incident_id: &str) {
+        // Find and clone the incident to prepare for drill-down mode
+        if let Some(incident) = self.filtered_incidents.iter().find(|i| i.id == incident_id) {
+            self.selected_incident = Some(incident.clone());
+        }
     }
 }
 
@@ -426,13 +497,13 @@ fn draw_incidents_table(f: &mut Frame, area: Rect, app: &mut App) {
         let severity_style = get_severity_style(&incident.severity);
         let status_style = get_status_style(&incident.status);
 
-        // Optimized string operations - use owned strings to avoid borrow issues
+        // Optimised string operations - use owned strings to avoid borrow issues
         let id_display = incident.id.chars().take(10).collect::<String>();
-        let alert_count = incident.alerts.len().to_string();
+        let alert_count = incident.alert_count.to_string();
         let formatted_created = incident.creation_time.format("%Y-%m-%d %H:%M:%S").to_string();
         let formatted_updated = incident.last_updated
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-            .unwrap_or_else(|| "N/A".to_string());
+            .unwrap_or_else(|| "".to_string());
 
         Row::new(vec![
             Cell::from(id_display),
@@ -636,7 +707,7 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App) {
 
     // Show instance endpoint and status message
     let status_text = format!("Instance: {} | {}", 
-        app.tenant_url.as_deref().unwrap_or("Not configured"), 
+        app.tenant_url.as_deref().unwrap_or(""), 
         app.status_message);
     let status = Paragraph::new(status_text)
         .style(status_style)
@@ -645,7 +716,7 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App) {
 
     // Controls help
     let help_text =
-        "↑↓: Navigate | Enter: Details | 1-4: Filter Severity | s: Status | c: Clear | q: Quit";
+        "↑↓: Navigate | Enter: Details | Esc/Back: Return | 1-4: Filter Severity | s: Status | c: Clear | q: Quit";
     let help = Paragraph::new(help_text)
         .style(Style::default().fg(Color::Yellow))
         .block(Block::default().borders(Borders::ALL).title("Controls"));
@@ -656,9 +727,9 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_drill_down_header(f: &mut Frame, area: Rect, app: &App) {
     let title = if let Some(incident) = app.get_selected_incident() {
-        format!("XDRTop - Case Details: {}", incident.id)
+        format!("│XDRTop - Cortex XDR Case Monitor v{} - Case Details: {}", env!("CARGO_PKG_VERSION"), incident.id)
     } else {
-        "XDRTop - Case Details".to_string()
+        format!("│XDRTop - Cortex XDR Case Monitor v{} - Case Details", env!("CARGO_PKG_VERSION"))
     };
 
     let header = Paragraph::new(title)
@@ -676,16 +747,20 @@ fn draw_incident_details(f: &mut Frame, area: Rect, app: &App) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(8), // Case summary
-                Constraint::Min(10),   // Issues details
+                Constraint::Length(12), // Case summary - increased to show description
+                Constraint::Length(5),  // MITRE ATT&CK info
+                Constraint::Min(10),    // Issues details
             ])
             .split(area);
 
         // Case summary
         draw_incident_summary(f, chunks[0], incident);
+        
+        // MITRE ATT&CK information
+        draw_mitre_info(f, chunks[1], incident);
 
         // Issues details
-        draw_alerts_details(f, chunks[1], incident);
+        draw_alerts_details(f, chunks[2], incident);
     } else {
         let error = Paragraph::new("No case selected")
             .style(Style::default().fg(Color::Red))
@@ -747,7 +822,7 @@ fn draw_incident_summary(f: &mut Frame, area: Rect, incident: &Incident) {
             Span::raw(
                 incident.last_updated
                     .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                    .unwrap_or_else(|| "N/A".to_string())
+                    .unwrap_or_else(|| "".to_string())
             ),
         ]),
         Line::from(vec![
@@ -757,7 +832,7 @@ fn draw_incident_summary(f: &mut Frame, area: Rect, incident: &Incident) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(incident.alerts.len().to_string()),
+            Span::raw(incident.alert_count.to_string()),
         ]),
         Line::from(vec![Span::styled(
             "Description: ",
@@ -774,77 +849,186 @@ fn draw_incident_summary(f: &mut Frame, area: Rect, incident: &Incident) {
     f.render_widget(summary, area);
 }
 
-fn draw_alerts_details(f: &mut Frame, area: Rect, incident: &Incident) {
-    let alert_items: Vec<ListItem> = incident
-        .alerts
-        .iter()
-        .enumerate()
-        .map(|(i, alert)| {
-            let mut alert_text = vec![
-                Line::from(vec![
-                    Span::styled(
-                        format!("Issue {}: ", i + 1),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(&alert.name),
-                ]),
-                Line::from(vec![
-                    Span::styled("  Severity: ", Style::default().fg(Color::Gray)),
-                    Span::styled(&alert.severity, get_severity_style(&alert.severity)),
-                ]),
-                Line::from(vec![
-                    Span::styled("  Category: ", Style::default().fg(Color::Gray)),
-                    Span::raw(&alert.category),
-                ]),
-                Line::from(vec![
-                    Span::styled("  Source: ", Style::default().fg(Color::Gray)),
-                    Span::raw(alert.source.as_deref().unwrap_or("Unknown")),
-                ]),
-                Line::from(vec![
-                    Span::styled("  Host: ", Style::default().fg(Color::Gray)),
-                    Span::raw(alert.host_name.as_deref().unwrap_or("Unknown")),
-                ]),
-            ];
+fn draw_mitre_info(f: &mut Frame, area: Rect, incident: &Incident) {
+    // Collect MITRE data from incident first, then fallback to alert-level data
+    let mut tactics = incident.mitre_tactics.clone();
+    let mut techniques = incident.mitre_techniques.clone();
+    
+    // If incident-level MITRE data is empty, aggregate from alerts
+    if tactics.is_empty() && techniques.is_empty() && !incident.alerts.is_empty() {
+        let mut all_tactics = std::collections::HashSet::new();
+        let mut all_techniques = std::collections::HashSet::new();
+        
+        for alert in &incident.alerts {
+            all_tactics.extend(alert.mitre_tactics.iter().cloned());
+            all_techniques.extend(alert.mitre_techniques.iter().cloned());
+        }
+        
+        tactics = all_tactics.into_iter().collect();
+        techniques = all_techniques.into_iter().collect();
+    }
+    
+    let tactics_text = if tactics.is_empty() {
+        "No MITRE ATT&CK framework data returned".to_string()
+    } else {
+        tactics.join(", ")
+    };
+    
+    let techniques_text = if techniques.is_empty() {
+        "No MITRE ATT&CK framework data returned".to_string() 
+    } else {
+        techniques.join(", ")
+    };
 
-            // Add MITRE tactics
+    let mitre_info = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("MITRE Tactics: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(tactics_text),
+        ]),
+        Line::from(vec![
+            Span::styled("MITRE Techniques: ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(techniques_text),
+        ]),
+    ])
+    .block(Block::default().borders(Borders::ALL).title("MITRE ATT&CK Framework"));
+    
+    f.render_widget(mitre_info, area);
+}
+
+fn draw_alerts_details(f: &mut Frame, area: Rect, incident: &Incident) {
+    // Display actual alert/issue details from the API
+    let alert_items: Vec<ListItem> = if incident.alerts.is_empty() {
+        if incident.alert_count == 0 {
+            vec![
+                ListItem::new(Line::from(vec![
+                    Span::styled("No issues found for this case", Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)),
+                ])),
+                ListItem::new(Line::from("")),
+                ListItem::new(Line::from(vec![
+                    Span::styled("This case shows 0 issues in the summary.", Style::default().fg(Color::Gray)),
+                ])),
+                ListItem::new(Line::from(vec![
+                    Span::styled("The case may be a false positive or already resolved.", Style::default().fg(Color::Gray)),
+                ])),
+            ]
+        } else {
+            vec![
+                ListItem::new(Line::from(vec![
+                    Span::styled("Issue details not available", Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC)),
+                ])),
+                ListItem::new(Line::from("")),
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("Case shows {} issue(s) but details couldn't be loaded", incident.alert_count),
+                        Style::default().fg(Color::Gray),
+                    ),
+                ])),
+                ListItem::new(Line::from(vec![
+                    Span::styled("This may be due to API permissions or network issues.", Style::default().fg(Color::Gray)),
+                ])),
+            ]
+        }
+    } else {
+        let mut items = vec![
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("Individual Issues ({} total):", incident.alerts.len()),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+            ])),
+            ListItem::new(Line::from("")),
+        ];
+
+        for (i, alert) in incident.alerts.iter().enumerate() {
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("Issue {}: ", i + 1),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(&alert.name),
+            ])));
+            
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled("  Severity: ", Style::default().fg(Color::Gray)),
+                Span::styled(&alert.severity, get_severity_style(&alert.severity)),
+            ])));
+            
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled("  Category: ", Style::default().fg(Color::Gray)),
+                Span::raw(&alert.category),
+            ])));
+            
+            if let Some(description) = &alert.description {
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled("  Description: ", Style::default().fg(Color::Gray)),
+                    Span::raw(description),
+                ])));
+            }
+            
+            if let Some(source) = &alert.source {
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled("  Source: ", Style::default().fg(Color::Gray)),
+                    Span::raw(source),
+                ])));
+            }
+            
+            if let Some(user_name) = &alert.user_name {
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled("  User: ", Style::default().fg(Color::Gray)),
+                    Span::raw(user_name),
+                ])));
+            }
+            
+            if let Some(action_pretty) = &alert.action_pretty {
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled("  Action: ", Style::default().fg(Color::Gray)),
+                    Span::raw(action_pretty),
+                ])));
+            }
+            
+            if let Some(host_name) = &alert.host_name {
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled("  Host: ", Style::default().fg(Color::Gray)),
+                    Span::raw(host_name),
+                ])));
+            }
+            
             if !alert.mitre_tactics.is_empty() {
-                alert_text.push(Line::from(vec![
+                items.push(ListItem::new(Line::from(vec![
                     Span::styled("  MITRE Tactics: ", Style::default().fg(Color::Gray)),
                     Span::styled(
                         alert.mitre_tactics.join(", "),
                         Style::default().fg(Color::LightBlue),
                     ),
-                ]));
+                ])));
             }
-
-            // Add MITRE techniques
+            
             if !alert.mitre_techniques.is_empty() {
-                alert_text.push(Line::from(vec![
+                items.push(ListItem::new(Line::from(vec![
                     Span::styled("  MITRE Techniques: ", Style::default().fg(Color::Gray)),
                     Span::styled(
                         alert.mitre_techniques.join(", "),
                         Style::default().fg(Color::LightGreen),
                     ),
-                ]));
+                ])));
             }
+            
+            items.push(ListItem::new(Line::from("")));
+        }
 
-            alert_text.push(Line::from(""));
-            ListItem::new(alert_text)
-        })
-        .collect();
+        items
+    };
 
     let alerts_list = List::new(alert_items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!("Issues ({})", incident.alerts.len())),
+            .title(format!("Issues ({})", incident.alert_count)),
     );
     f.render_widget(alerts_list, area);
 }
 
 fn draw_drill_down_status_bar(f: &mut Frame, area: Rect, _app: &App) {
-    let help_text = "Press 'Esc' or 'Backspace' to return to main view | 'q' to quit";
+    let help_text = "Press 'Esc' or 'Backspace' to return to main view | 'q' to quit application";
     let status = Paragraph::new(help_text)
         .style(Style::default().fg(Color::Yellow))
         .block(Block::default().borders(Borders::ALL).title("Navigation"));

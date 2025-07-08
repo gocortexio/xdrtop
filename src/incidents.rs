@@ -8,6 +8,9 @@ pub struct Alert {
     pub category: String,
     pub source: Option<String>,
     pub host_name: Option<String>,
+    pub description: Option<String>,
+    pub user_name: Option<String>,
+    pub action_pretty: Option<String>,
     pub mitre_tactics: Vec<String>,
     pub mitre_techniques: Vec<String>,
 }
@@ -20,8 +23,11 @@ pub struct Incident {
     pub description: String,
     pub creation_time: DateTime<Utc>,
     pub last_updated: Option<DateTime<Utc>>,
-
+    pub alert_count: u32,
     pub alerts: Vec<Alert>,
+    // MITRE ATT&CK data from main incident response
+    pub mitre_tactics: Vec<String>,
+    pub mitre_techniques: Vec<String>,
 }
 
 impl Incident {
@@ -58,16 +64,38 @@ impl IncidentStore {
     }
 
     pub fn update(&mut self, new_incidents: Vec<Incident>) {
-        // Clear existing incidents and update with new ones
+        // Optimise for large datasets - avoid redundant operations
+        let new_incident_count = new_incidents.len();
+        
+        // Check if we can skip expensive operations
+        if new_incident_count == self.incidents.len() {
+            let mut same_incidents = true;
+            for incident in &new_incidents {
+                if !self.incidents.contains_key(&incident.id) {
+                    same_incidents = false;
+                    break;
+                }
+            }
+            if same_incidents {
+                return; // No changes needed
+            }
+        }
+        
+        // Clear and update with optimised capacity allocation
         self.incidents.clear();
+        self.incidents.reserve(new_incident_count);
 
         for incident in new_incidents {
             self.incidents.insert(incident.id.clone(), incident);
         }
 
-        // Sort incidents by severity (highest first) then by creation time (newest first)
-        self.sorted_incidents = self.incidents.values().cloned().collect();
-        self.sorted_incidents.sort_by(|a, b| {
+        // Pre-allocate sorted vector to avoid reallocations
+        self.sorted_incidents.clear();
+        self.sorted_incidents.reserve(self.incidents.len());
+        self.sorted_incidents.extend(self.incidents.values().cloned());
+        
+        // Sort by severity (highest first) then by creation time (newest first)
+        self.sorted_incidents.sort_unstable_by(|a, b| {
             match b.severity_priority().cmp(&a.severity_priority()) {
                 std::cmp::Ordering::Equal => b.creation_time.cmp(&a.creation_time),
                 other => other,
