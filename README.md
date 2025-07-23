@@ -199,7 +199,7 @@ To check the current version:
 ./xdrtop --version
 ```
 
-Current release: **v1.0.32** with integrated MITRE ATT&CK framework support.
+Current release: **v1.0.33** with integrated MITRE ATT&CK framework support.
 
 ## Development
 
