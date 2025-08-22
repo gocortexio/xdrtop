@@ -366,7 +366,7 @@ impl App {
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
-    let size = f.size();
+    let size = f.area();
 
     // Safety check: if we're in drill-down mode but have no selected incident, exit drill-down
     if app.is_drill_down_mode() && app.get_selected_incident().is_none() {
@@ -533,7 +533,7 @@ fn draw_incidents_table(f: &mut Frame, area: Rect, app: &mut App) {
                 .borders(Borders::ALL)
                 .title("Cases (↑/↓ to navigate, Enter to view details)"),
         )
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol(">> ");
 
     // Use standard table rendering without viewport adjustments

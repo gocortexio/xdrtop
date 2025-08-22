@@ -3,13 +3,13 @@ use chrono::{DateTime, Utc};
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 
-use tokio::time::{timeout, Duration, Instant};
+use tokio::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::incidents::{Alert, Incident};
@@ -75,6 +75,11 @@ pub struct XdrClient {
     last_response_etag: Arc<std::sync::Mutex<Option<String>>>,
     last_successful_poll: Arc<std::sync::Mutex<Option<Instant>>>,
     consecutive_errors: Arc<AtomicU64>,
+    
+    // Performance caching for paginated results
+    cached_incidents: Arc<std::sync::Mutex<Option<Vec<Incident>>>>,
+    cache_timestamp: Arc<std::sync::Mutex<Option<Instant>>>,
+    cache_duration: Duration,
 }
 
 impl XdrClient {
@@ -86,155 +91,225 @@ impl XdrClient {
             last_response_etag: Arc::new(std::sync::Mutex::new(None)),
             last_successful_poll: Arc::new(std::sync::Mutex::new(None)),
             consecutive_errors: Arc::new(AtomicU64::new(0)),
+            
+            // Cache configuration - 2 minutes cache duration for large paginated datasets
+            cached_incidents: Arc::new(std::sync::Mutex::new(None)),
+            cache_timestamp: Arc::new(std::sync::Mutex::new(None)),
+            cache_duration: Duration::from_secs(120), // 2 minute cache for performance
         }
     }
 
     pub async fn get_incidents(&self) -> Result<Vec<Incident>> {
+        // Check cache first to prevent unnecessary API calls
+        if let Ok(cache_guard) = self.cached_incidents.lock() {
+            if let Some(ref cached) = *cache_guard {
+                if let Ok(timestamp_guard) = self.cache_timestamp.lock() {
+                    if let Some(cache_time) = *timestamp_guard {
+                        if cache_time.elapsed() < self.cache_duration {
+                            if self.debug_enabled {
+                                self.safe_debug_log(format!(
+                                    "\n=== CACHE HIT ===\nReturning {} cached incidents\nCache age: {:?}\n=====================================",
+                                    cached.len(),
+                                    cache_time.elapsed()
+                                ));
+                            }
+                            return Ok(cached.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Cache miss or expired - fetch fresh data
+        let incidents = self.get_all_incidents_paginated().await?;
+        
+        // Update cache
+        if let Ok(mut cache_guard) = self.cached_incidents.lock() {
+            *cache_guard = Some(incidents.clone());
+        }
+        if let Ok(mut timestamp_guard) = self.cache_timestamp.lock() {
+            *timestamp_guard = Some(Instant::now());
+        }
+
+        if self.debug_enabled {
+            self.safe_debug_log(format!(
+                "\n=== CACHE UPDATED ===\nStored {} incidents in cache\n=====================================",
+                incidents.len()
+            ));
+        }
+
+        Ok(incidents)
+    }
+
+    /// Fetch all incidents using proper pagination to get complete dataset
+    async fn get_all_incidents_paginated(&self) -> Result<Vec<Incident>> {
         let url = format!(
             "{}/public_api/v1/incidents/get_incidents/",
             self.config.tenant_url
         );
 
-        // Create request payload
-        let request_data = HashMap::new();
-        let request_body = GetIncidentsRequest { request_data };
+        let mut all_incidents = Vec::new();
+        let mut search_from = 0;
+        let page_size = 100; // Standard page size
+        let mut dedupe_set = HashSet::new();
 
-        // Log POST content for debugging (only when --debug flag is enabled)
+        // Debug log pagination start
         if self.debug_enabled {
             self.safe_debug_log(format!(
-                "\n=== POST CONTENT FOR INCIDENTS API ===\nURL: {}\nPOST Body: {}\nHeaders:\n  x-xdr-auth-id: {}\n  Authorization: {}...\n  Content-Type: application/json\n=====================================",
-                url,
-                serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| "Failed to serialize".to_string()),
-                self.config.api_key_id,
-                if self.config.api_key_secret.len() >= 10 { 
-                    &self.config.api_key_secret[..10]
-                } else { 
-                    &self.config.api_key_secret
-                }
+                "\n=== STARTING PAGINATED INCIDENT FETCH ===\nURL: {}\nPage Size: {}\n=====================================",
+                url, page_size
             ));
         }
 
-        // Build request with conditional ETag caching
-        let mut request_builder = self
-            .client
-            .post(&url)
-            .header("x-xdr-auth-id", &self.config.api_key_id)
-            .header("Authorization", &self.config.api_key_secret)
-            .header("Content-Type", "application/json")
-            .timeout(Duration::from_secs(30))
-            .json(&request_body);
+        loop {
+            let search_to = search_from + page_size;
+            
+            // Create paginated request payload
+            let mut request_data = HashMap::new();
+            request_data.insert("filters".to_string(), serde_json::json!([]));
+            request_data.insert("search_from".to_string(), serde_json::json!(search_from));
+            request_data.insert("search_to".to_string(), serde_json::json!(search_to));
+            request_data.insert("sort".to_string(), serde_json::json!({
+                "field": "modification_time",
+                "keyword": "desc"
+            }));
 
-        // Add If-None-Match header for caching if we have an ETag (with timeout)
-        match timeout(Duration::from_millis(100), async {
-            self.last_response_etag.lock()
-        }).await {
-            Ok(Ok(etag_guard)) => {
-                if let Some(ref etag) = *etag_guard {
-                    request_builder = request_builder.header("If-None-Match", etag);
-                }
+            let request_body = GetIncidentsRequest { request_data };
+
+            // Log POST content for debugging (only when --debug flag is enabled)
+            if self.debug_enabled {
+                self.safe_debug_log(format!(
+                    "\n=== PAGINATED POST REQUEST (Page {}) ===\nURL: {}\nPOST Body: {}\nHeaders:\n  x-xdr-auth-id: {}\n  Authorization: {}...\n  Content-Type: application/json\nRange: {} - {}\n=====================================",
+                    (search_from / page_size) + 1,
+                    url,
+                    serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| "Failed to serialize".to_string()),
+                    self.config.api_key_id,
+                    if self.config.api_key_secret.len() >= 10 { 
+                        &self.config.api_key_secret[..10]
+                    } else { 
+                        &self.config.api_key_secret
+                    },
+                    search_from,
+                    search_to
+                ));
             }
-            Ok(Err(_)) | Err(_) => {
-                // Mutex poisoned or timeout - continue without ETag
-            }
-        }
 
-        // Debug logging removed for production use
-        
-        let response = request_builder.send().await.map_err(|e| {
-            self.consecutive_errors.fetch_add(1, Ordering::Relaxed);
-            // Network error logged internally
-            anyhow!("Network error: {}", sanitize_error_message(&e.to_string()))
-        })?;
+            // Build paginated request (disable ETag caching for paginated requests)
+            let request_builder = self
+                .client
+                .post(&url)
+                .header("x-xdr-auth-id", &self.config.api_key_id)
+                .header("Authorization", &self.config.api_key_secret)
+                .header("Content-Type", "application/json")
+                .timeout(Duration::from_secs(30))
+                .json(&request_body);
 
-        let status = response.status();
-
-        // Handle 304 Not Modified - data unchanged
-        if status == 304 {
-            self.consecutive_errors.store(0, Ordering::Relaxed);
-            return Ok(vec![]); // Return empty vec to indicate no changes
-        }
-
-        // Handle rate limiting with exponential backoff
-        if status == 429 {
-            self.consecutive_errors.fetch_add(1, Ordering::Relaxed);
-            return Err(anyhow!("Rate limit exceeded - will retry with backoff"));
-        }
-
-        if !status.is_success() {
-            self.consecutive_errors.fetch_add(1, Ordering::Relaxed);
-            let _error_body = response.text().await.unwrap_or_else(|_| "No response body".to_string());
-            return Err(anyhow!("API request failed with status: {}", status));
-        }
-
-        // Store ETag for future requests
-        if let Some(etag) = response.headers().get("etag") {
-            if let Ok(etag_str) = etag.to_str() {
-                if let Ok(mut etag_guard) = self.last_response_etag.lock() {
-                    *etag_guard = Some(etag_str.to_string());
-                }
-            }
-        }
-
-        // Get response text first
-        let response_text = response.text().await.map_err(|e| {
-            self.consecutive_errors.fetch_add(1, Ordering::Relaxed);
-            anyhow!("Failed to read response: {}", sanitize_error_message(&e.to_string()))
-        })?;
-
-        // Log raw incidents response for debugging (only when --debug flag is enabled)
-        if self.debug_enabled {
-            self.safe_debug_log(format!(
-                "\n=== INCIDENTS API RAW RESPONSE ===\nResponse length: {} chars\nFirst 1000 chars: {}\n=== END INCIDENTS RESPONSE ===\n",
-                response_text.len(),
-                &response_text.chars().take(1000).collect::<String>()
-            ));
-        }
-
-        // Parse JSON response
-        let api_response: GetIncidentsResponse =
-            serde_json::from_str(&response_text).map_err(|_e| {
+            let response = request_builder.send().await.map_err(|e| {
                 self.consecutive_errors.fetch_add(1, Ordering::Relaxed);
-                anyhow!("Invalid response format received")
+                anyhow!("Network error during pagination: {}", sanitize_error_message(&e.to_string()))
             })?;
 
-        // Success - reset error counter and update last successful poll (with timeout)
-        self.consecutive_errors.store(0, Ordering::Relaxed);
-        match timeout(Duration::from_millis(100), async {
-            self.last_successful_poll.lock()
-        }).await {
-            Ok(Ok(mut last_poll)) => {
-                *last_poll = Some(Instant::now());
+            let status = response.status();
+
+            // Handle rate limiting with exponential backoff
+            if status == 429 {
+                self.consecutive_errors.fetch_add(1, Ordering::Relaxed);
+                return Err(anyhow!("Rate limit exceeded during pagination - will retry with backoff"));
             }
-            Ok(Err(_)) | Err(_) => {
-                // Mutex poisoned or timeout - continue without updating timestamp
+
+            if !status.is_success() {
+                self.consecutive_errors.fetch_add(1, Ordering::Relaxed);
+                let error_body = response.text().await.unwrap_or_else(|_| "No response body".to_string());
+                return Err(anyhow!("Paginated API request failed with status: {} - {}", status, error_body));
             }
+
+            let body = response.text().await.map_err(|e| {
+                self.consecutive_errors.fetch_add(1, Ordering::Relaxed);
+                anyhow!("Failed to read paginated response body: {}", e)
+            })?;
+
+            let response: GetIncidentsResponse = serde_json::from_str(&body).map_err(|e| {
+                self.consecutive_errors.fetch_add(1, Ordering::Relaxed);
+                anyhow!("Invalid paginated response format: {}", e)
+            })?;
+
+            let total_count = response.reply.total_count;
+            let page_incidents = response.reply.incidents;
+            
+            // Debug log pagination progress
+            if self.debug_enabled {
+                self.safe_debug_log(format!(
+                    "\n=== PAGINATION PROGRESS ===\nPage: {}\nReceived: {} incidents\nTotal Count: {}\nRange: {} - {}\nAll Collected: {}\n=====================================",
+                    (search_from / page_size) + 1,
+                    page_incidents.len(),
+                    total_count,
+                    search_from,
+                    search_to,
+                    all_incidents.len()
+                ));
+            }
+
+            // Convert and deduplicate incidents
+            for api_incident in page_incidents {
+                let incident_id = api_incident.incident_id.clone();
+                if dedupe_set.insert(incident_id) {
+                    // Only add if we haven't seen this incident_id before
+                    let incident = self.convert_incident(api_incident);
+                    all_incidents.push(incident);
+                }
+            }
+
+            // Check if we've fetched all available incidents
+            if search_to >= total_count as usize {
+                if self.debug_enabled {
+                    self.safe_debug_log(format!(
+                        "\n=== PAGINATION COMPLETE ===\nTotal Incidents Fetched: {}\nUnique Incidents: {}\nAPI Total Count: {}\n=====================================",
+                        all_incidents.len() + dedupe_set.len() - all_incidents.len(), // Total fetched including dupes
+                        all_incidents.len(), // Unique count
+                        total_count
+                    ));
+                }
+                break;
+            }
+
+            // Move to next page
+            search_from += page_size;
         }
 
-        // Convert incidents without fetching alerts initially for performance
-        // Alert details will be fetched on-demand when user drills down
-        let incidents = api_response
-            .reply
-            .incidents
-            .into_iter()
-            .map(|api_incident| self.convert_incident(api_incident))
-            .collect();
+        // Success - reset error counter
+        self.consecutive_errors.store(0, Ordering::Relaxed);
+        
+        // Store timestamp for success tracking
+        if let Ok(mut last_success) = self.last_successful_poll.lock() {
+            *last_success = Some(Instant::now());
+        }
 
-        Ok(incidents)
+        if self.debug_enabled {
+            self.safe_debug_log(format!(
+                "\n=== FINAL PAGINATION RESULT ===\nTotal Unique Incidents: {}\nPages Fetched: {}\n=====================================",
+                all_incidents.len(),
+                (search_from / page_size)
+            ));
+        }
+
+        Ok(all_incidents)
     }
 
     pub fn get_adaptive_poll_interval(&self) -> Duration {
         let error_count = self.consecutive_errors.load(Ordering::Relaxed);
-        let base_interval = 30000; // 30 seconds base
+        
+        // Longer base interval for large paginated datasets - reduces API load
+        let base_interval = 120000; // 2 minutes base (matching cache duration)
         
         // Adaptive polling based on errors and success patterns
         let interval_ms = if error_count == 0 {
             // Check if we've had recent successful polls for faster updates
             if let Ok(last_poll) = self.last_successful_poll.lock() {
                 if let Some(last_time) = *last_poll {
-                    if last_time.elapsed() < Duration::from_secs(300) { // 5 minutes
-                        base_interval / 2 // 15 seconds when recently successful
+                    if last_time.elapsed() < Duration::from_secs(600) { // 10 minutes
+                        base_interval // Use full cache duration as poll interval
                     } else {
-                        base_interval
+                        base_interval * 2 // Slower when no recent activity
                     }
                 } else {
                     base_interval
@@ -245,7 +320,7 @@ impl XdrClient {
         } else {
             // Exponential backoff with jitter for errors
             let backoff_multiplier = 1 << std::cmp::min(error_count, 6); // Cap at 64x
-            let max_interval = 300000; // 5 minutes maximum
+            let max_interval = 600000; // 10 minutes maximum
             std::cmp::min(base_interval * backoff_multiplier, max_interval)
         };
 
@@ -260,6 +335,19 @@ impl XdrClient {
 
     pub fn get_error_count(&self) -> u64 {
         self.consecutive_errors.load(Ordering::Relaxed)
+    }
+
+    /// Clear cache to force fresh data fetch (useful for manual refresh)
+    pub fn clear_cache(&self) {
+        if let Ok(mut cache_guard) = self.cached_incidents.lock() {
+            *cache_guard = None;
+        }
+        if let Ok(mut timestamp_guard) = self.cache_timestamp.lock() {
+            *timestamp_guard = None;
+        }
+        if self.debug_enabled {
+            self.safe_debug_log("\n=== CACHE CLEARED ===\nForcing fresh data fetch on next request\n=====================================".to_string());
+        }
     }
 
     fn convert_incident(&self, api_incident: ApiIncident) -> Incident {
