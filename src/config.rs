@@ -14,23 +14,20 @@ pub struct Config {
     pub filter_settings: FilterSettings,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FilterSettings {
     pub severity_filter: Option<String>,
     pub status_filter: Option<String>,
 }
 
-impl Default for FilterSettings {
-    fn default() -> Self {
-        Self {
-            severity_filter: None,
-            status_filter: None,
-        }
-    }
-}
-
 impl Config {
     pub async fn load() -> Result<Self> {
+        // First try to load from environment variables (Replit secrets)
+        if let Ok(config) = Self::from_env() {
+            return Ok(config);
+        }
+
+        // Fall back to config file
         let config_path = get_config_path()?;
 
         if !config_path.exists() {
@@ -43,6 +40,30 @@ impl Config {
         let content = tokio::fs::read_to_string(&config_path).await?;
         let config: Config = serde_json::from_str(&content)?;
         Ok(config)
+    }
+
+    /// Load configuration from environment variables (for Replit deployment)
+    fn from_env() -> Result<Self> {
+        let api_key_id = std::env::var("XDR_API_KEY_ID")
+            .map_err(|_| anyhow!("XDR_API_KEY_ID not set"))?;
+        let api_key_secret = std::env::var("XDR_API_KEY")
+            .map_err(|_| anyhow!("XDR_API_KEY not set"))?;
+        let tenant_url = std::env::var("XDR_FQDN")
+            .map_err(|_| anyhow!("XDR_FQDN not set"))?;
+
+        // Ensure tenant URL has proper format
+        let tenant_url = if tenant_url.starts_with("https://") {
+            tenant_url
+        } else {
+            format!("https://{tenant_url}")
+        };
+
+        Ok(Config {
+            api_key_id,
+            api_key_secret,
+            tenant_url,
+            filter_settings: FilterSettings::default(),
+        })
     }
     
     pub async fn update_filter_settings(&mut self, severity_filter: Option<String>, status_filter: Option<String>) -> Result<()> {

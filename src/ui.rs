@@ -8,19 +8,21 @@ use ratatui::{
 };
 use std::collections::{HashMap, VecDeque};
 
-use crate::incidents::{Incident, Alert};
+use crate::cases::{Case, IssueDetail};
 
 pub struct App {
-    pub incidents: Vec<Incident>,
-    pub filtered_incidents: Vec<Incident>,
+    pub cases: Vec<Case>,
+    pub filtered_cases: Vec<Case>,
     pub table_state: TableState,
     pub status_message: String,
     pub is_error: bool,
     pub last_update: chrono::DateTime<chrono::Utc>,
     pub drill_down_mode: bool,
-    pub selected_incident: Option<Incident>,
+    pub selected_case: Option<Case>,
     pub severity_filter: Option<String>,
     pub status_filter: Option<String>,
+    pub domain_filter: Option<String>,
+    pub observed_domains: Vec<String>,
     pub api_calls: VecDeque<DateTime<Utc>>,
     pub next_poll_time: Option<DateTime<Utc>>,
     pub tenant_url: Option<String>,
@@ -31,16 +33,18 @@ pub struct App {
 impl App {
     pub fn new() -> Self {
         Self {
-            incidents: Vec::new(),
-            filtered_incidents: Vec::new(),
+            cases: Vec::new(),
+            filtered_cases: Vec::new(),
             table_state: TableState::default(),
-            status_message: "".to_string(),
+            status_message: String::new(),
             is_error: false,
             last_update: chrono::Utc::now(),
             drill_down_mode: false,
-            selected_incident: None,
+            selected_case: None,
             severity_filter: None,
             status_filter: None,
+            domain_filter: None,
+            observed_domains: Vec::new(),
             api_calls: VecDeque::new(),
             next_poll_time: None,
             tenant_url: None,
@@ -49,44 +53,44 @@ impl App {
         }
     }
 
-    pub fn set_incidents(&mut self, incidents: &[Incident]) {
+    pub fn set_cases(&mut self, cases: &[Case]) {
         // Handle large datasets (>500 cases) with optimised loading
-        if incidents.len() > 500 {
+        if cases.len() > 500 {
             self.loading_large_dataset = true;
-            self.status_message = format!("Loading {} cases...", incidents.len());
+            self.status_message = format!("Loading {} cases...", cases.len());
         }
         
-        // Skip redundant operations if incidents haven't changed
-        if incidents.len() == self.incidents.len() && 
-           incidents.iter().zip(&self.incidents).all(|(a, b)| a.id == b.id) {
+        // Skip redundant operations if cases haven't changed
+        if cases.len() == self.cases.len() && 
+           cases.iter().zip(&self.cases).all(|(a, b)| a.id == b.id) {
             self.loading_large_dataset = false;
             return;
         }
         
         // Pre-allocate vectors for large datasets to avoid reallocations
-        if incidents.len() > self.incidents.capacity() {
-            self.incidents.reserve(incidents.len());
+        if cases.len() > self.cases.capacity() {
+            self.cases.reserve(cases.len());
         }
         
         // Memory optimization: avoid unnecessary copying by using clone_from when possible
-        if self.incidents.len() == incidents.len() {
+        if self.cases.len() == cases.len() {
             // Reuse existing capacity and update in-place
-            self.incidents.clone_from_slice(incidents);
+            self.cases.clone_from_slice(cases);
         } else {
             // Only allocate new vector when size changes
-            self.incidents = incidents.to_vec();
+            self.cases = cases.to_vec();
         }
         self.apply_filters();
         self.last_update = chrono::Utc::now();
         self.loading_large_dataset = false;
 
-        // Reset selection if we have fewer incidents than before
-        let incident_count = self.filtered_incidents.len();
+        // Reset selection if we have fewer cases than before
+        let case_count = self.filtered_cases.len();
         if let Some(selected) = self.table_state.selected() {
-            if selected >= incident_count && incident_count > 0 {
-                self.table_state.select(Some(incident_count - 1));
+            if selected >= case_count && case_count > 0 {
+                self.table_state.select(Some(case_count - 1));
             }
-        } else if incident_count > 0 && !self.drill_down_mode {
+        } else if case_count > 0 && !self.drill_down_mode {
             // Only auto-select on first load when we have no selection and not in drill-down mode
             // Don't auto-select on Windows to prevent auto-entering case details
             #[cfg(not(target_os = "windows"))]
@@ -95,43 +99,68 @@ impl App {
     }
 
     fn apply_filters(&mut self) {
-        // Memory optimization: avoid unnecessary cloning and allocations
-        if self.severity_filter.is_none() && self.status_filter.is_none() {
+        // Update observed domains from current cases
+        self.update_observed_domains();
+
+        // Memory optimisation: avoid unnecessary cloning and allocations
+        if self.severity_filter.is_none() && self.status_filter.is_none() && self.domain_filter.is_none() {
             // No filters active - avoid cloning when possible
-            if self.filtered_incidents.len() != self.incidents.len() {
-                self.filtered_incidents.clone_from(&self.incidents);
+            if self.filtered_cases.len() != self.cases.len() {
+                self.filtered_cases.clone_from(&self.cases);
             }
             return;
         }
-        
+
         // Clear and pre-allocate with estimated capacity to avoid reallocations
-        self.filtered_incidents.clear();
-        let estimated_capacity = self.incidents.len() / 2; // Conservative estimate
-        if self.filtered_incidents.capacity() < estimated_capacity {
-            self.filtered_incidents.reserve(estimated_capacity);
+        self.filtered_cases.clear();
+        let estimated_capacity = self.cases.len() / 2;
+        if self.filtered_cases.capacity() < estimated_capacity {
+            self.filtered_cases.reserve(estimated_capacity);
         }
-        
-        for incident in &self.incidents {
+
+        for case in &self.cases {
             let mut include = true;
-            
+
             if let Some(ref severity_filter) = self.severity_filter {
-                if !incident.severity.eq_ignore_ascii_case(severity_filter) {
+                if !case.severity.eq_ignore_ascii_case(severity_filter) {
                     include = false;
                 }
             }
-            
+
             if include {
                 if let Some(ref status_filter) = self.status_filter {
-                    if !incident.status.eq_ignore_ascii_case(status_filter) {
+                    if !case.status.eq_ignore_ascii_case(status_filter) {
                         include = false;
                     }
                 }
             }
-            
+
             if include {
-                self.filtered_incidents.push(incident.clone());
+                if let Some(ref domain_filter) = self.domain_filter {
+                    match &case.case_domain {
+                        Some(domain) if domain.eq_ignore_ascii_case(domain_filter) => {}
+                        _ => include = false,
+                    }
+                }
+            }
+
+            if include {
+                self.filtered_cases.push(case.clone());
             }
         }
+    }
+
+    fn update_observed_domains(&mut self) {
+        let mut domain_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for case in &self.cases {
+            if let Some(ref domain) = case.case_domain {
+                if !domain.is_empty() {
+                    domain_set.insert(domain.clone());
+                }
+            }
+        }
+        self.observed_domains = domain_set.into_iter().collect();
+        self.observed_domains.sort();
     }
 
     pub fn toggle_severity_filter(&mut self, severity: String) {
@@ -147,15 +176,37 @@ impl App {
     pub fn clear_filters(&mut self) {
         self.severity_filter = None;
         self.status_filter = None;
+        self.domain_filter = None;
         self.apply_filters();
+    }
+
+    pub fn cycle_domain_filter(&mut self) {
+        if self.observed_domains.is_empty() {
+            return;
+        }
+
+        let current_index = self
+            .domain_filter
+            .as_ref()
+            .and_then(|domain| self.observed_domains.iter().position(|d| d == domain))
+            .unwrap_or(self.observed_domains.len() - 1);
+
+        let next_index = (current_index + 1) % self.observed_domains.len();
+        if next_index == 0 && self.domain_filter.is_some() {
+            self.domain_filter = None;
+        } else {
+            self.domain_filter = Some(self.observed_domains[next_index].clone());
+        }
+        self.apply_filters();
+        self.table_state.select(Some(0));
     }
 
     pub fn cycle_status_filter(&mut self) {
         // Get unique statuses from actual data
         let mut unique_statuses: Vec<String> = self
-            .incidents
+            .cases
             .iter()
-            .map(|incident| incident.status.clone())
+            .map(|case| case.status.clone())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
@@ -228,7 +279,6 @@ impl App {
         self.tenant_url = Some(url);
     }
 
-    /// Memory optimization: periodically clean up old data to prevent memory growth
     /// Check if enough time has passed since last key event to prevent double-key issues on Windows
     pub fn should_process_key(&mut self) -> bool {
         let now = std::time::Instant::now();
@@ -243,29 +293,30 @@ impl App {
         }
     }
 
+    #[allow(dead_code)]
     pub fn cleanup_memory(&mut self) {
         // Clean old API call records
         let cutoff = chrono::Utc::now() - chrono::Duration::seconds(120);
         self.api_calls.retain(|&time| time >= cutoff);
-        
+
         // Shrink capacity if vectors are oversized (more than 2x current size)
-        if self.incidents.capacity() > self.incidents.len() * 2 && self.incidents.capacity() > 100 {
-            self.incidents.shrink_to_fit();
+        if self.cases.capacity() > self.cases.len() * 2 && self.cases.capacity() > 100 {
+            self.cases.shrink_to_fit();
         }
-        
-        if self.filtered_incidents.capacity() > self.filtered_incidents.len() * 2 && self.filtered_incidents.capacity() > 100 {
-            self.filtered_incidents.shrink_to_fit();
+
+        if self.filtered_cases.capacity() > self.filtered_cases.len() * 2 && self.filtered_cases.capacity() > 100 {
+            self.filtered_cases.shrink_to_fit();
         }
     }
 
     pub fn next(&mut self) {
-        if self.filtered_incidents.is_empty() {
+        if self.filtered_cases.is_empty() {
             return;
         }
 
         let i = match self.table_state.selected() {
             Some(i) => {
-                if i >= self.filtered_incidents.len() - 1 {
+                if i >= self.filtered_cases.len() - 1 {
                     0
                 } else {
                     i + 1
@@ -277,14 +328,14 @@ impl App {
     }
 
     pub fn previous(&mut self) {
-        if self.filtered_incidents.is_empty() {
+        if self.filtered_cases.is_empty() {
             return;
         }
 
         let i = match self.table_state.selected() {
             Some(i) => {
                 if i == 0 {
-                    self.filtered_incidents.len() - 1
+                    self.filtered_cases.len() - 1
                 } else {
                     i - 1
                 }
@@ -294,38 +345,32 @@ impl App {
         self.table_state.select(Some(i));
     }
 
-
-
-
-
     pub fn get_severity_counts(&self) -> HashMap<String, usize> {
         let mut counts = HashMap::new();
-        // Use filtered incidents if filters are active, otherwise use all incidents
-        let incidents_to_count = if self.severity_filter.is_some() || self.status_filter.is_some() {
-            &self.filtered_incidents
+        // Use filtered cases if filters are active, otherwise use all cases
+        let cases_to_count = if self.severity_filter.is_some() || self.status_filter.is_some() {
+            &self.filtered_cases
         } else {
-            &self.incidents
+            &self.cases
         };
         
-        for incident in incidents_to_count {
-            *counts.entry(incident.severity.clone()).or_insert(0) += 1;
+        for case in cases_to_count {
+            *counts.entry(case.severity.clone()).or_insert(0) += 1;
         }
         counts
     }
 
-
-
     pub fn enter_drill_down(&mut self) {
-        // Only enter drill-down if we have incidents and a valid selection
-        if self.filtered_incidents.is_empty() {
+        // Only enter drill-down if we have cases and a valid selection
+        if self.filtered_cases.is_empty() {
             return;
         }
         
         if let Some(selected_idx) = self.table_state.selected() {
-            if selected_idx < self.filtered_incidents.len() {
-                let incident = &self.filtered_incidents[selected_idx];
+            if selected_idx < self.filtered_cases.len() {
+                let case = &self.filtered_cases[selected_idx];
 
-                self.selected_incident = Some(incident.clone());
+                self.selected_case = Some(case.clone());
                 self.drill_down_mode = true;
             }
         }
@@ -333,10 +378,10 @@ impl App {
 
     pub fn exit_drill_down(&mut self) {
         self.drill_down_mode = false;
-        self.selected_incident = None;
+        self.selected_case = None;
         
         // Ensure we have a valid selection when returning to main view
-        if !self.filtered_incidents.is_empty() && self.table_state.selected().is_none() {
+        if !self.filtered_cases.is_empty() && self.table_state.selected().is_none() {
             self.table_state.select(Some(0));
         }
     }
@@ -345,22 +390,22 @@ impl App {
         self.drill_down_mode
     }
 
-    pub fn get_selected_incident(&self) -> Option<&Incident> {
-        self.selected_incident.as_ref()
+    pub fn get_selected_case(&self) -> Option<&Case> {
+        self.selected_case.as_ref()
     }
     
-    pub fn update_selected_incident_alerts(&mut self, alerts: Vec<Alert>) {
-        if let Some(ref mut incident) = self.selected_incident {
-            // Only update alerts, preserve the original alert_count from the main incidents API
-            // The main incidents API has the authoritative count, individual alerts API may be incomplete
-            incident.alerts = alerts;
+    pub fn update_selected_case_issues(&mut self, issues: Vec<IssueDetail>) {
+        if let Some(ref mut case) = self.selected_case {
+            // Only update issues, preserve the original issue_count from the main cases API
+            // The main cases API has the authoritative count, individual issues API may be incomplete
+            case.issues = issues;
         }
     }
     
-    pub fn prepare_for_drill_down(&mut self, incident_id: &str) {
-        // Find and clone the incident to prepare for drill-down mode
-        if let Some(incident) = self.filtered_incidents.iter().find(|i| i.id == incident_id) {
-            self.selected_incident = Some(incident.clone());
+    pub fn prepare_for_drill_down(&mut self, case_id: &str) {
+        // Find and clone the case to prepare for drill-down mode
+        if let Some(case) = self.filtered_cases.iter().find(|c| c.id == case_id) {
+            self.selected_case = Some(case.clone());
         }
     }
 }
@@ -368,8 +413,8 @@ impl App {
 pub fn draw(f: &mut Frame, app: &mut App) {
     let size = f.area();
 
-    // Safety check: if we're in drill-down mode but have no selected incident, exit drill-down
-    if app.is_drill_down_mode() && app.get_selected_incident().is_none() {
+    // Safety check: if we're in drill-down mode but have no selected case, exit drill-down
+    if app.is_drill_down_mode() && app.get_selected_case().is_none() {
         app.exit_drill_down();
     }
 
@@ -400,8 +445,8 @@ fn draw_main_view(f: &mut Frame, size: Rect, app: &mut App) {
         .constraints([Constraint::Percentage(75), Constraint::Percentage(25)])
         .split(main_chunks[1]);
 
-    // Incidents table
-    draw_incidents_table(f, content_chunks[0], app);
+    // Cases table
+    draw_cases_table(f, content_chunks[0], app);
 
     // Sidebar with stats and details
     draw_sidebar(f, content_chunks[1], app);
@@ -415,7 +460,7 @@ fn draw_drill_down_view(f: &mut Frame, size: Rect, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // Header
-            Constraint::Min(10),   // Incident details
+            Constraint::Min(10),   // Case details
             Constraint::Length(3), // Status bar
         ])
         .split(size);
@@ -423,8 +468,8 @@ fn draw_drill_down_view(f: &mut Frame, size: Rect, app: &mut App) {
     // Header with drill-down indicator
     draw_drill_down_header(f, chunks[0], app);
 
-    // Incident details
-    draw_incident_details(f, chunks[1], app);
+    // Case details
+    draw_case_details(f, chunks[1], app);
 
     // Status bar with navigation help
     draw_drill_down_status_bar(f, chunks[2], app);
@@ -448,20 +493,14 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(title, header_chunks[0]);
 
     // Stats summary
-    let total_incidents = app.incidents.len();
-    let filtered_count = app.filtered_incidents.len();
+    let total_cases = app.cases.len();
+    let filtered_count = app.filtered_cases.len();
     let last_update = app.last_update.format("%H:%M:%S").to_string();
 
-    let stats_text = if total_incidents != filtered_count {
-        format!(
-            "Cases: {}/{} | Updated: {}",
-            filtered_count, total_incidents, last_update
-        )
+    let stats_text = if total_cases != filtered_count {
+        format!("Cases: {filtered_count}/{total_cases} | Updated: {last_update}")
     } else {
-        format!(
-            "Total Cases: {} | Updated: {}",
-            total_incidents, last_update
-        )
+        format!("Total Cases: {total_cases} | Updated: {last_update}")
     };
 
     let stats = Paragraph::new(stats_text)
@@ -470,11 +509,12 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(stats, header_chunks[1]);
 }
 
-fn draw_incidents_table(f: &mut Frame, area: Rect, app: &mut App) {
+fn draw_cases_table(f: &mut Frame, area: Rect, app: &mut App) {
     let header_cells = [
         "ID",
         "Severity", 
         "Status",
+        "Domain",
         "Description",
         "Issues",
         "Created",
@@ -492,38 +532,42 @@ fn draw_incidents_table(f: &mut Frame, area: Rect, app: &mut App) {
     let header = Row::new(header_cells).height(1).bottom_margin(1);
 
     // Disable viewport rendering to fix scrolling issues - render all rows
-    let rows = app.filtered_incidents.iter().map(|incident| {
+    let rows = app.filtered_cases.iter().map(|case| {
         // Use cached style functions
-        let severity_style = get_severity_style(&incident.severity);
-        let status_style = get_status_style(&incident.status);
+        let severity_style = get_severity_style(&case.severity);
+        let status_style = get_status_style(&case.status);
 
         // Optimised string operations - use owned strings to avoid borrow issues
-        let id_display = incident.id.chars().take(10).collect::<String>();
-        let alert_count = incident.alert_count.to_string();
-        let formatted_created = incident.creation_time.format("%Y-%m-%d %H:%M:%S").to_string();
-        let formatted_updated = incident.last_updated
+        let id_display = case.id.chars().take(10).collect::<String>();
+        let issue_count = case.issue_count.to_string();
+        let formatted_created = case.creation_time.format("%Y-%m-%d %H:%M:%S").to_string();
+        let formatted_updated = case.last_updated
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-            .unwrap_or_else(|| "".to_string());
+            .unwrap_or_default();
+
+        let domain_display = case.case_domain.clone().unwrap_or_default();
 
         Row::new(vec![
             Cell::from(id_display),
-            Cell::from(incident.severity.clone()).style(severity_style),
-            Cell::from(incident.status.clone()).style(status_style),
-            Cell::from(incident.truncated_description(85)), // Increased to use more available space
-            Cell::from(alert_count),
+            Cell::from(case.severity.clone()).style(severity_style),
+            Cell::from(case.status.clone()).style(status_style),
+            Cell::from(domain_display),
+            Cell::from(case.truncated_description(60)), // Reduced to make room for domain column
+            Cell::from(issue_count),
             Cell::from(formatted_created),
             Cell::from(formatted_updated),
         ])
     });
 
     let widths = [
-        Constraint::Length(12),     // ID (increased from 10)
+        Constraint::Length(12),     // ID
         Constraint::Length(8),      // Severity
-        Constraint::Length(22),     // Status (restored to 22)
-        Constraint::Percentage(45), // Description (increased from 35 to use more space)
-        Constraint::Length(7),      // Issues (increased from 6)
-        Constraint::Length(20),     // Created (increased from 19)
-        Constraint::Length(20),     // Last Updated (increased from 19)
+        Constraint::Length(22),     // Status
+        Constraint::Length(12),     // Domain
+        Constraint::Percentage(30), // Description (reduced to make room for domain)
+        Constraint::Length(7),      // Issues
+        Constraint::Length(20),     // Created
+        Constraint::Length(20),     // Last Updated
     ];
 
     let table = Table::new(rows, widths)
@@ -531,7 +575,7 @@ fn draw_incidents_table(f: &mut Frame, area: Rect, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Cases (↑/↓ to navigate, Enter to view details)"),
+                .title("Cases (Up/Down to navigate, Enter to view details)"),
         )
         .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol(">> ");
@@ -563,21 +607,21 @@ fn draw_sidebar(f: &mut Frame, area: Rect, app: &App) {
 fn draw_severity_summary(f: &mut Frame, area: Rect, app: &App) {
     let severity_counts = app.get_severity_counts();
     
-    // Show total incidents and actual severity values
-    let total_incidents = app.incidents.len();
+    // Show total cases and actual severity values
+    let total_cases = app.cases.len();
     let mut lines = vec![
         Line::from(vec![
             Span::styled("Total: ", Style::default().fg(Color::Gray)),
-            Span::styled(total_incidents.to_string(), Style::default().fg(Color::White)),
+            Span::styled(total_cases.to_string(), Style::default().fg(Color::White)),
         ]),
     ];
     
-    // If we have incidents but no severity counts, show what severity values we actually have
-    if total_incidents > 0 && severity_counts.is_empty() {
+    // If we have cases but no severity counts, show what severity values we actually have
+    if total_cases > 0 && severity_counts.is_empty() {
         lines.push(Line::from("No severity data found"));
         // Show first few actual severity values for troubleshooting
-        for (i, incident) in app.incidents.iter().take(3).enumerate() {
-            lines.push(Line::from(format!("#{}: '{}'", i+1, incident.severity)));
+        for (i, case) in app.cases.iter().take(3).enumerate() {
+            lines.push(Line::from(format!("#{}: '{}'", i+1, case.severity)));
         }
     } else {
         // Show standard severity breakdown
@@ -596,106 +640,106 @@ fn draw_severity_summary(f: &mut Frame, area: Rect, app: &App) {
             };
 
             lines.push(Line::from(vec![
-                Span::styled(format!("{}: ", severity), style),
-                Span::raw(count.to_string()),
+                Span::styled(format!("{severity}: "), Style::default().fg(Color::Gray)),
+                Span::styled(count.to_string(), style),
             ]));
         }
     }
 
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().title("Severity").borders(Borders::ALL))
-        .wrap(Wrap { trim: true });
-    f.render_widget(paragraph, area);
+    let severity_summary = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("Severity"));
+    f.render_widget(severity_summary, area);
 }
 
 fn draw_status_summary(f: &mut Frame, area: Rect, app: &App) {
-    let now = chrono::Utc::now();
-    let next_poll = app.next_poll_time.unwrap_or(now);
-    let seconds_until_poll = (next_poll - now).num_seconds().max(0);
-    
-    let mut lines = vec![
+    let poll_interval = std::time::Duration::from_secs(120);
+    let poll_secs = poll_interval.as_secs();
+    let next_poll_text = app.next_poll_time
+        .map(|time| {
+            let now = chrono::Utc::now();
+            if time > now {
+                let diff_secs = (time - now).num_seconds();
+                format!("{diff_secs}s")
+            } else {
+                "now".to_string()
+            }
+        })
+        .unwrap_or_else(|| format!("{poll_secs}s"));
+
+    let lines = vec![
         Line::from(vec![
-            Span::styled("Next poll in: ", Style::default().fg(Color::Cyan)),
-            Span::styled(
-                format!("{}s", seconds_until_poll),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-            ),
+            Span::styled("Next poll in: ", Style::default().fg(Color::Gray)),
+            Span::styled(next_poll_text, Style::default().fg(Color::White)),
         ]),
         Line::from(""),
+        Line::from(vec![
+            Span::styled("Mode: ", Style::default().fg(Color::Gray)),
+            Span::styled("Backoff mode", Style::default().fg(Color::Yellow)),
+        ]),
+        Line::from(vec![
+            Span::styled(format!("({})", format_duration(poll_interval)), Style::default().fg(Color::Gray)),
+        ]),
     ];
-    
-    // Add polling status information
-    let poll_status = if seconds_until_poll > 60 {
-        format!("Backoff mode ({}m {}s)", seconds_until_poll / 60, seconds_until_poll % 60)
-    } else if seconds_until_poll > 30 {
-        "Standard polling".to_string()
+
+    let status = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("Polling Status"));
+    f.render_widget(status, area);
+}
+
+fn format_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    if secs >= 60 {
+        let mins = secs / 60;
+        let remaining_secs = secs % 60;
+        format!("{mins}m {remaining_secs}s")
     } else {
-        "Active polling".to_string()
-    };
-    
-    lines.push(Line::from(vec![
-        Span::styled("Mode: ", Style::default().fg(Color::Gray)),
-        Span::styled(poll_status, Style::default().fg(Color::White)),
-    ]));
-    
-    // Add API performance info
-    let api_calls = app.api_calls.len();
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
-        Span::styled("API calls (60s): ", Style::default().fg(Color::Gray)),
-        Span::styled(api_calls.to_string(), Style::default().fg(Color::Green)),
-    ]));
-    
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().title("Polling Status").borders(Borders::ALL))
-        .wrap(Wrap { trim: true });
-    f.render_widget(paragraph, area);
+        format!("{secs}s")
+    }
 }
 
 fn draw_filter_help(f: &mut Frame, area: Rect, app: &App) {
-    let mut filter_text = vec![Line::from("Filters:"), Line::from("")];
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Filters:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(""),
+    ];
 
-    if let Some(ref severity) = app.severity_filter {
-        filter_text.push(Line::from(vec![
-            Span::styled("Severity: ", Style::default().fg(Color::Yellow)),
-            Span::raw(severity),
+    // Show active filters
+    if app.severity_filter.is_some() || app.status_filter.is_some() || app.domain_filter.is_some() {
+        if let Some(ref filter) = app.severity_filter {
+            lines.push(Line::from(vec![
+                Span::styled("Severity: ", Style::default().fg(Color::Gray)),
+                Span::styled(filter, Style::default().fg(Color::Cyan)),
+            ]));
+        }
+        if let Some(ref filter) = app.status_filter {
+            lines.push(Line::from(vec![
+                Span::styled("Status: ", Style::default().fg(Color::Gray)),
+                Span::styled(filter, Style::default().fg(Color::Cyan)),
+            ]));
+        }
+        if let Some(ref filter) = app.domain_filter {
+            lines.push(Line::from(vec![
+                Span::styled("Domain: ", Style::default().fg(Color::Gray)),
+                Span::styled(filter, Style::default().fg(Color::Cyan)),
+            ]));
+        }
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("None active", Style::default().fg(Color::Gray)),
         ]));
     }
 
-    if let Some(ref status) = app.status_filter {
-        filter_text.push(Line::from(vec![
-            Span::styled("Status: ", Style::default().fg(Color::Yellow)),
-            Span::raw(status),
-        ]));
-    }
-
-    if app.severity_filter.is_none() && app.status_filter.is_none() {
-        filter_text.push(Line::from(Span::styled(
-            "None active",
-            Style::default().fg(Color::Gray),
-        )));
-    }
-
-    filter_text.push(Line::from(""));
-    filter_text.push(Line::from("Keys:"));
-    filter_text.push(Line::from("1-4: Filter severity"));
-    filter_text.push(Line::from("s: Filter status"));
-    filter_text.push(Line::from("c: Clear filters"));
-
-    let paragraph = Paragraph::new(filter_text)
-        .block(
-            Block::default()
-                .title("Filters & Controls")
-                .borders(Borders::ALL),
-        )
-        .wrap(Wrap { trim: true });
-    f.render_widget(paragraph, area);
+    let help = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title("Filters & Controls"));
+    f.render_widget(help, area);
 }
 
 fn draw_status_bar(f: &mut Frame, area: Rect, app: &App) {
-    let chunks = Layout::default()
+    let status_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
 
     // Status message
@@ -705,62 +749,54 @@ fn draw_status_bar(f: &mut Frame, area: Rect, app: &App) {
         Style::default().fg(Color::Green)
     };
 
-    // Show instance endpoint and status message
-    let status_text = format!("Instance: {} | {}", 
-        app.tenant_url.as_deref().unwrap_or(""), 
-        app.status_message);
-    let status = Paragraph::new(status_text)
+    let instance_text = app.tenant_url.clone().unwrap_or_else(|| "Unknown".to_string());
+    let status = Paragraph::new(format!("Instance: {instance_text}"))
         .style(status_style)
         .block(Block::default().borders(Borders::ALL).title("Status"));
-    f.render_widget(status, chunks[0]);
+    f.render_widget(status, status_chunks[0]);
 
-    // Controls help
-    let help_text =
-        "↑↓: Navigate | Enter: Details | Esc/Back: Return | 1-4: Filter Severity | s: Status | c: Clear | q: Quit";
-    let help = Paragraph::new(help_text)
-        .style(Style::default().fg(Color::Yellow))
+    // Controls
+    let controls = Paragraph::new("Up/Down: Navigate | Enter: Details | q: Quit")
+        .style(Style::default().fg(Color::White))
         .block(Block::default().borders(Borders::ALL).title("Controls"));
-    f.render_widget(help, chunks[1]);
+    f.render_widget(controls, status_chunks[1]);
 }
 
-
-
 fn draw_drill_down_header(f: &mut Frame, area: Rect, app: &App) {
-    let title = if let Some(incident) = app.get_selected_incident() {
-        format!("│XDRTop - Cortex XDR Case Monitor v{} - Case Details: {}", env!("CARGO_PKG_VERSION"), incident.id)
-    } else {
-        format!("│XDRTop - Cortex XDR Case Monitor v{} - Case Details", env!("CARGO_PKG_VERSION"))
-    };
-
-    let header = Paragraph::new(title)
+    let case_id = app.get_selected_case()
+        .map(|c| c.id.clone())
+        .unwrap_or_else(|| "Unknown".to_string());
+        
+    let header_text = format!("Case Details - ID: {case_id}");
+    let header = Paragraph::new(header_text)
         .style(
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )
-        .block(Block::default().borders(Borders::ALL));
+        .block(Block::default().borders(Borders::ALL).title("Drill-Down View"));
     f.render_widget(header, area);
 }
 
-fn draw_incident_details(f: &mut Frame, area: Rect, app: &App) {
-    if let Some(incident) = app.get_selected_incident() {
+fn draw_case_details(f: &mut Frame, area: Rect, app: &App) {
+    if let Some(case) = app.get_selected_case() {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(12), // Case summary - increased to show description
-                Constraint::Length(5),  // MITRE ATT&CK info
+                Constraint::Length(12), // Case summary
+                Constraint::Length(6),  // MITRE info
                 Constraint::Min(10),    // Issues details
             ])
             .split(area);
 
         // Case summary
-        draw_incident_summary(f, chunks[0], incident);
-        
+        draw_case_summary(f, chunks[0], case);
+
         // MITRE ATT&CK information
-        draw_mitre_info(f, chunks[1], incident);
+        draw_mitre_info(f, chunks[1], case);
 
         // Issues details
-        draw_alerts_details(f, chunks[2], incident);
+        draw_issues_details(f, chunks[2], case);
     } else {
         let error = Paragraph::new("No case selected")
             .style(Style::default().fg(Color::Red))
@@ -769,16 +805,16 @@ fn draw_incident_details(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn draw_incident_summary(f: &mut Frame, area: Rect, incident: &Incident) {
+fn draw_case_summary(f: &mut Frame, area: Rect, case: &Case) {
     let summary_text = vec![
         Line::from(vec![
             Span::styled(
-                "ID: ",
+                "Case ID: ",
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(&incident.id),
+            Span::raw(&case.id),
         ]),
         Line::from(vec![
             Span::styled(
@@ -787,7 +823,7 @@ fn draw_incident_summary(f: &mut Frame, area: Rect, incident: &Incident) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(&incident.severity, get_severity_style(&incident.severity)),
+            Span::styled(&case.severity, get_severity_style(&case.severity)),
         ]),
         Line::from(vec![
             Span::styled(
@@ -796,7 +832,16 @@ fn draw_incident_summary(f: &mut Frame, area: Rect, incident: &Incident) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(&incident.status),
+            Span::styled(&case.status, get_status_style(&case.status)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Domain: ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(case.case_domain.clone().unwrap_or_else(|| "-".to_string())),
         ]),
         Line::from(vec![
             Span::styled(
@@ -805,12 +850,7 @@ fn draw_incident_summary(f: &mut Frame, area: Rect, incident: &Incident) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(
-                incident
-                    .creation_time
-                    .format("%Y-%m-%d %H:%M:%S UTC")
-                    .to_string(),
-            ),
+            Span::raw(case.creation_time.format("%Y-%m-%d %H:%M:%S UTC").to_string()),
         ]),
         Line::from(vec![
             Span::styled(
@@ -820,9 +860,9 @@ fn draw_incident_summary(f: &mut Frame, area: Rect, incident: &Incident) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(
-                incident.last_updated
+                case.last_updated
                     .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-                    .unwrap_or_else(|| "".to_string())
+                    .unwrap_or_default()
             ),
         ]),
         Line::from(vec![
@@ -832,7 +872,7 @@ fn draw_incident_summary(f: &mut Frame, area: Rect, incident: &Incident) {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw(incident.alert_count.to_string()),
+            Span::raw(case.issue_count.to_string()),
         ]),
         Line::from(vec![Span::styled(
             "Description: ",
@@ -840,7 +880,7 @@ fn draw_incident_summary(f: &mut Frame, area: Rect, incident: &Incident) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )]),
-        Line::from(Span::raw(&incident.description)),
+        Line::from(Span::raw(&case.description)),
     ];
 
     let summary = Paragraph::new(summary_text)
@@ -849,24 +889,11 @@ fn draw_incident_summary(f: &mut Frame, area: Rect, incident: &Incident) {
     f.render_widget(summary, area);
 }
 
-fn draw_mitre_info(f: &mut Frame, area: Rect, incident: &Incident) {
-    // Collect MITRE data from incident first, then fallback to alert-level data
-    let mut tactics = incident.mitre_tactics.clone();
-    let mut techniques = incident.mitre_techniques.clone();
-    
-    // If incident-level MITRE data is empty, aggregate from alerts
-    if tactics.is_empty() && techniques.is_empty() && !incident.alerts.is_empty() {
-        let mut all_tactics = std::collections::HashSet::new();
-        let mut all_techniques = std::collections::HashSet::new();
-        
-        for alert in &incident.alerts {
-            all_tactics.extend(alert.mitre_tactics.iter().cloned());
-            all_techniques.extend(alert.mitre_techniques.iter().cloned());
-        }
-        
-        tactics = all_tactics.into_iter().collect();
-        techniques = all_techniques.into_iter().collect();
-    }
+fn draw_mitre_info(f: &mut Frame, area: Rect, case: &Case) {
+    // MITRE data comes from the case level, not individual issues
+    // The issue/search API does not return MITRE data directly
+    let tactics = &case.mitre_tactics;
+    let techniques = &case.mitre_techniques;
     
     let tactics_text = if tactics.is_empty() {
         "No MITRE ATT&CK framework data returned".to_string()
@@ -895,10 +922,10 @@ fn draw_mitre_info(f: &mut Frame, area: Rect, incident: &Incident) {
     f.render_widget(mitre_info, area);
 }
 
-fn draw_alerts_details(f: &mut Frame, area: Rect, incident: &Incident) {
-    // Display actual alert/issue details from the API
-    let alert_items: Vec<ListItem> = if incident.alerts.is_empty() {
-        if incident.alert_count == 0 {
+fn draw_issues_details(f: &mut Frame, area: Rect, case: &Case) {
+    // Display actual issue details from the API
+    let issue_items: Vec<ListItem> = if case.issues.is_empty() {
+        if case.issue_count == 0 {
             vec![
                 ListItem::new(Line::from(vec![
                     Span::styled("No issues found for this case", Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC)),
@@ -919,7 +946,7 @@ fn draw_alerts_details(f: &mut Frame, area: Rect, incident: &Incident) {
                 ListItem::new(Line::from("")),
                 ListItem::new(Line::from(vec![
                     Span::styled(
-                        format!("Case shows {} issue(s) but details couldn't be loaded", incident.alert_count),
+                        format!("Case shows {} issue(s) but details couldn't be loaded", case.issue_count),
                         Style::default().fg(Color::Gray),
                     ),
                 ])),
@@ -932,84 +959,57 @@ fn draw_alerts_details(f: &mut Frame, area: Rect, incident: &Incident) {
         let mut items = vec![
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    format!("Individual Issues ({} total):", incident.alerts.len()),
+                    format!("Individual Issues ({} total):", case.issues.len()),
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
                 ),
             ])),
             ListItem::new(Line::from("")),
         ];
 
-        for (i, alert) in incident.alerts.iter().enumerate() {
+        for (i, issue) in case.issues.iter().enumerate() {
             items.push(ListItem::new(Line::from(vec![
                 Span::styled(
                     format!("Issue {}: ", i + 1),
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(&alert.name),
+                Span::raw(&issue.name),
             ])));
             
             items.push(ListItem::new(Line::from(vec![
                 Span::styled("  Severity: ", Style::default().fg(Color::Gray)),
-                Span::styled(&alert.severity, get_severity_style(&alert.severity)),
+                Span::styled(&issue.severity, get_severity_style(&issue.severity)),
             ])));
             
             items.push(ListItem::new(Line::from(vec![
                 Span::styled("  Category: ", Style::default().fg(Color::Gray)),
-                Span::raw(&alert.category),
+                Span::raw(&issue.category),
             ])));
             
-            if let Some(description) = &alert.description {
+            if let Some(ref description) = issue.description {
                 items.push(ListItem::new(Line::from(vec![
                     Span::styled("  Description: ", Style::default().fg(Color::Gray)),
                     Span::raw(description),
                 ])));
             }
             
-            if let Some(source) = &alert.source {
+            if let Some(ref remediation) = issue.remediation {
                 items.push(ListItem::new(Line::from(vec![
-                    Span::styled("  Source: ", Style::default().fg(Color::Gray)),
-                    Span::raw(source),
+                    Span::styled("  Remediation: ", Style::default().fg(Color::Gray)),
+                    Span::raw(remediation),
                 ])));
             }
-            
-            if let Some(user_name) = &alert.user_name {
+
+            if !issue.asset_names.is_empty() {
                 items.push(ListItem::new(Line::from(vec![
-                    Span::styled("  User: ", Style::default().fg(Color::Gray)),
-                    Span::raw(user_name),
+                    Span::styled("  Assets: ", Style::default().fg(Color::Gray)),
+                    Span::raw(issue.asset_names.join(", ")),
                 ])));
             }
-            
-            if let Some(action_pretty) = &alert.action_pretty {
+
+            if let Some(ref detection_method) = issue.detection_method {
                 items.push(ListItem::new(Line::from(vec![
-                    Span::styled("  Action: ", Style::default().fg(Color::Gray)),
-                    Span::raw(action_pretty),
-                ])));
-            }
-            
-            if let Some(host_name) = &alert.host_name {
-                items.push(ListItem::new(Line::from(vec![
-                    Span::styled("  Host: ", Style::default().fg(Color::Gray)),
-                    Span::raw(host_name),
-                ])));
-            }
-            
-            if !alert.mitre_tactics.is_empty() {
-                items.push(ListItem::new(Line::from(vec![
-                    Span::styled("  MITRE Tactics: ", Style::default().fg(Color::Gray)),
-                    Span::styled(
-                        alert.mitre_tactics.join(", "),
-                        Style::default().fg(Color::LightBlue),
-                    ),
-                ])));
-            }
-            
-            if !alert.mitre_techniques.is_empty() {
-                items.push(ListItem::new(Line::from(vec![
-                    Span::styled("  MITRE Techniques: ", Style::default().fg(Color::Gray)),
-                    Span::styled(
-                        alert.mitre_techniques.join(", "),
-                        Style::default().fg(Color::LightGreen),
-                    ),
+                    Span::styled("  Detection: ", Style::default().fg(Color::Gray)),
+                    Span::raw(detection_method),
                 ])));
             }
             
@@ -1019,12 +1019,12 @@ fn draw_alerts_details(f: &mut Frame, area: Rect, incident: &Incident) {
         items
     };
 
-    let alerts_list = List::new(alert_items).block(
+    let issues_list = List::new(issue_items).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!("Issues ({})", incident.alert_count)),
+            .title(format!("Issues ({})", case.issue_count)),
     );
-    f.render_widget(alerts_list, area);
+    f.render_widget(issues_list, area);
 }
 
 fn draw_drill_down_status_bar(f: &mut Frame, area: Rect, _app: &App) {

@@ -1,93 +1,65 @@
+<div align="center">
+  <img src="assets/xdrtop-logo.png" alt="XDRTop Logo" width="600"/>
+</div>
+
 # XDRTop
 
-A high-performance Rust CLI monitoring tool for Cortex XDR, delivering real-time, interactive case tracking with advanced terminal-based visualisation and comprehensive filtering capabilities.
+Terminal-based monitoring tool for Cortex XSIAM/CLOUD and XDR from GoCortex.io
 
-## Features
+A Rust CLI application providing real-time, interactive case tracking with an htop-style interface. XDRTop connects to the Cortex Platform Cases API to display security cases with filtering, drill-down issue details, and MITRE ATT&CK framework integration.
 
-### Core Features
-- **Interactive Terminal**: htop-style interface with keyboard navigation
-- **Complete Incident Coverage**: Fetches ALL incidents using intelligent pagination (not just first 100)
-- **High-Performance Caching**: Smart 2-minute caching system for optimal responsiveness
-- **Real-time Monitoring**: Adaptive polling with automatic backoff and rate limiting
-- **Comprehensive Filtering**: Filter by severity (Critical/High/Medium/Low) and status
-- **Detailed Case View**: Drill-down to see complete case information and associated alerts
-- **Secure Configuration**: Encrypted API credentials stored locally
-- **MITRE ATT&CK Integration**: Framework support for threat intelligence analysis
+## Overview
 
-## Key Technologies
+XDRTop enables security teams to monitor Cortex Platform cases directly from the terminal without browser access. It fetches all cases using intelligent pagination, caches results for performance, and provides keyboard-driven navigation for efficient case triage.
 
-- **Rust**: High-performance systems programming language for optimal terminal performance
-- **Tokio**: Async runtime for concurrent operations and non-blocking API calls
-- **Ratatui**: Modern terminal user interface framework with rich widgets
-- **Serde**: JSON serialisation/deserialisation for API data handling
-- **Reqwest**: HTTP client with TLS support for secure API communication
-- **Chrono**: Date and time handling with timezone support
-- **Crossterm**: Cross-platform terminal manipulation
+### Features
+
+- Interactive terminal interface with real-time updates
+- Complete case coverage via paginated API fetching
+- Two-minute smart caching to reduce API load
+- Severity and status filtering with keyboard shortcuts
+- Case drill-down showing issue details and MITRE ATT&CK data
+- Domain-based filtering (Security, Posture)
+- Cross-platform support (Linux, macOS, Windows)
 
 ## Installation
 
 ### Prerequisites
 
 - Rust 1.70 or later
-- Cortex XDR API credentials (API Key ID and Secret)
-- Network access to your Cortex XDR tenant
-
-#### Windows Requirements
-- **Microsoft Visual C++ Redistributable**: Required to resolve vcruntime140.dll errors
-  - Download from: https://aka.ms/vs/17/release/vc_redist.x64.exe
-  - Install both x64 and x86 versions if unsure about your system architecture
-- **Windows 10/11**: Recommended for best compatibility
+- Cortex Platform API credentials (API Key ID and Secret)
+- Network access to your Cortex Platform tenant
 
 ### Building from Source
 
 ```bash
-git clone https://github.com/your-org/xdrtop.git
+git clone https://github.com/gocortexio/xdrtop.git
 cd xdrtop
 cargo build --release
 ```
 
 The binary will be available at `target/release/xdrtop`
 
-### Quick Build
-
-```bash
-cargo run
-```
-
 ## Configuration
 
-### Initial Setup
-
-Run the following command to set up your API credentials:
+Run the following command to configure API credentials:
 
 ```bash
 ./xdrtop --init-config
 ```
 
-You'll be prompted to enter:
-- **API Key ID**: Your Cortex XDR API key identifier
-- **API Key Secret**: Your Cortex XDR API secret key
-- **Tenant URL**: Your Cortex XDR tenant URL (e.g., `https://api-your-tenant.xdr.au.paloaltonetworks.com`)
+You will be prompted to enter:
+- API Key ID: Your Cortex Platform API key identifier
+- API Key Secret: Your Cortex Platform API secret key
+- Tenant URL: Your Cortex Platform tenant URL (e.g., https://api-tenant.xdr.au.paloaltonetworks.com)
 
-### Configuration File
-
-Credentials are stored securely in a platform-specific location:
-- **Windows**: `%USERPROFILE%\.xdrtop\config.json` (e.g., `C:\Users\username\.xdrtop\config.json`)
-- **Linux/macOS**: `~/.xdrtop/config.json`
-
-The configuration file has the following structure:
-
-```json
-{
-  "api_key_id": "your-api-key-id",
-  "api_key_secret": "your-api-key-secret",
-  "tenant_url": "https://api-your-tenant.xdr.au.paloaltonetworks.com"
-}
-```
+Credentials are stored in a platform-specific location:
+- Linux/macOS: ~/.xdrtop/config.json
+- Windows: %USERPROFILE%\.xdrtop\config.json
 
 ## Usage
 
-### Basic Operation
+### Starting XDRTop
 
 ```bash
 ./xdrtop
@@ -95,175 +67,80 @@ The configuration file has the following structure:
 
 ### Command Line Options
 
-- `--init-config`: Initialise API configuration
-- `--debug`: Enable debug logging to debug_output.log file
-- `--help`: Display help information
-- `--version`: Show version information
+| Option | Description |
+|--------|-------------|
+| --init-config | Configure API credentials |
+| --debug | Enable debug logging to debug_output.log |
+| --help | Display help information |
+| --version | Show version information |
 
-### Usage
+### Keyboard Controls
 
-**Basic Navigation:**
-- `↑/↓` - Navigate through cases
-- `Enter` - View detailed case information
-- `Esc` - Return to main view
-- `q` - Quit application
+| Key | Action |
+|-----|--------|
+| Up/Down | Navigate through cases |
+| Enter | View case details and issues |
+| Esc | Return to main view |
+| q | Quit application |
+| 1-4 | Filter by severity (1=Critical, 2=High, 3=Medium, 4=Low) |
+| s | Cycle through status filters |
+| d | Cycle through domain filters |
+| c | Clear all filters |
 
-**Filtering:**
-- `1-4` - Filter by severity (Critical/High/Medium/Low)
-- `s` - Cycle through status filters
-- `c` - Clear all filters
+### Colour Coding
+
+| Severity | Colour |
+|----------|--------|
+| Critical | Red |
+| High | Light Red |
+| Medium | Yellow |
+| Low | Green |
 
 ## API Integration
 
-XDRTop uses two Cortex XDR API endpoints:
+XDRTop uses the Cortex XDR v1 API:
 
-- **Main Cases**: `POST /public_api/v1/incidents/get_incidents/` - Fetches case list
-- **Case Details**: `POST /public_api/v1/incidents/get_incident_extra_data/` - Fetches detailed case information and alerts
+| Endpoint | Purpose |
+|----------|---------|
+| /public_api/v1/case/search | Fetch cases with pagination |
+| /public_api/v1/issue/search | Fetch issue details for drill-down |
 
-The application polls every 30 seconds with automatic rate limiting and error recovery.
-
-## Colour Coding
-
-- **Critical**: Red (highest priority)
-- **High**: Light Red
-- **Medium**: Yellow
-- **Low**: Green
-
-## Security
-
-- API credentials stored securely in user home directory
-- All communications use TLS encryption
-- No local data persistence beyond active session
+The application polls every two minutes with automatic rate limiting and exponential backoff for error recovery.
 
 ## Troubleshooting
 
-### Common Issues
+### Configuration Not Found
 
-1. **Configuration Errors**
-   ```
-   Error: Configuration file not found. Run with --init-config to set up credentials.
-   ```
-   **Solution**: Run `./xdrtop --init-config` to set up credentials
+```
+Error: Configuration file not found
+```
 
-2. **Windows vcruntime140.dll Error**
-   ```
-   Error: The code execution cannot proceed because vcruntime140.dll was not found
-   ```
-   **Solution**: Install Microsoft Visual C++ Redistributable:
-   - Download: https://aka.ms/vs/17/release/vc_redist.x64.exe
-   - Run installer as administrator
-   - Restart terminal/command prompt after installation
+Run `./xdrtop --init-config` to set up credentials.
 
-3. **Windows Application Stability**
-   If the Windows version starts in case details mode or crashes on Escape:
-   - This issue has been fixed in v1.0.12+ (current: v1.0.24)
-   - The application now properly initialises in main table view
-   - Escape key handling is more robust and won't cause crashes
+### API Connection Issues
 
-3. **API Connection Issues**
-   ```
-   Error: builder error: relative URL without a base
-   ```
-   **Solution**: Verify tenant URL includes protocol (https://) and is correctly formatted
+```
+Error: builder error: relative URL without a base
+```
 
-4. **Authentication Failures**
-   ```
-   Error: Authentication failed
-   ```
-   **Solution**: Verify API key ID and secret are correct and have proper permissions
-
-5. **Rate Limiting**
-   ```
-   Warning: Rate limit exceeded, backing off...
-   ```
-   **Solution**: XDRTop automatically handles this with exponential backoff
-
-6. **Network Connectivity**
-   ```
-   Error: Failed to connect to API
-   ```
-   **Solution**: Check network connectivity and firewall settings
+Verify the tenant URL includes the protocol (https://) and is correctly formatted.
 
 ### Debug Mode
 
-For detailed logging including pagination and caching information:
+For detailed logging:
 
 ```bash
 ./xdrtop --debug
 ```
 
-This enables comprehensive debug output including:
-- Pagination progress and API call details
-- Cache hit/miss statistics 
-- Performance metrics and timing information
-- API request/response logging
+Debug output is written to debug_output.log in the current directory.
 
-For Rust-level debugging, set the `RUST_LOG` environment variable:
+## Contact and Support
 
-```bash
-RUST_LOG=debug ./xdrtop
-```
+For documentation, updates, and support, visit GoCortex.io (https://gocortex.io).
 
-Available log levels: `error`, `warn`, `info`, `debug`, `trace`
+Developed by Simon Sigre at GoCortex.io.
 
-### Version Information
+---
 
-To check the current version:
-
-```bash
-./xdrtop --version
-```
-
-Current release: **v1.0.35** with complete pagination support and performance optimization.
-
-## Performance & Scalability
-
-### Large Environment Support
-- **Complete Data Coverage**: Automatically fetches ALL incidents using intelligent pagination
-- **Handles 1000+ incidents**: Efficiently processes large security environments
-- **Smart Caching**: 2-minute cache system reduces API load by 75-87%
-- **Optimized Polling**: Adaptive intervals prevent unnecessary API calls
-
-### Performance Metrics
-- **Initial Load**: 2-4 seconds for complete incident dataset
-- **Navigation**: Instant response using cached data
-- **Memory Usage**: ~100KB cache footprint for 300+ incidents
-- **API Efficiency**: 4 calls every 2 minutes (vs. previous 4 calls every 15-30 seconds)
-
-### Scalability Features
-- **Automatic Deduplication**: Prevents duplicate incidents across paginated responses
-- **Rate Limiting Compliance**: Built-in exponential backoff for API rate limits
-- **Resource Management**: Timeout protection and memory optimization
-- **Cross-Platform**: Optimized for Windows, Linux, and macOS
-
-## Development
-
-```bash
-git clone https://github.com/your-org/xdrtop.git
-cd xdrtop
-cargo build --release
-```
-
-Built with Rust for high performance and cross-platform compatibility.
-
-## Licence
-
-This project is licensed under the MIT Licence - see the LICENCE file for details.
-
-## Support
-
-For issues and questions:
-1. Check the troubleshooting section above
-2. Review existing GitHub issues
-3. Create a new issue with detailed information including:
-   - Operating system and terminal type
-   - Rust version (`rustc --version`)
-   - Error messages and logs
-   - Steps to reproduce the issue
-
-## Acknowledgements
-
-- **Palo Alto Networks**: For the Cortex XDR API
-- **Rust Community**: For excellent crates and documentation
-- **Ratatui Project**: For the powerful terminal UI framework
-
+Version: 2.0.3 | Licence: MIT | Platform: Linux, macOS, Windows

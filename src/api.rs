@@ -1,85 +1,46 @@
+// XDRTop API Module
+// Cortex XDR Cases and Issues API client with typed requests, incremental sync, and intelligent caching
+// Version 2.0.1 - Complete terminology migration to Cases/Issues
+// Following British English conventions throughout
+
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
-
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-
-
 use tokio::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::incidents::{Alert, Incident};
+use crate::cases::{IssueDetail, Case};
+use crate::types::{
+    ApiCase, ApiIssue, CaseSearchRequestData, GetCasesRequest, GetCasesResponse,
+    GetIssuesRequest, GetIssuesResponse, IssueSearchRequestData,
+};
 
-#[derive(Debug, Serialize)]
-struct GetIncidentsRequest {
-    request_data: HashMap<String, serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct GetIncidentsResponse {
-    reply: IncidentsReply,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct IncidentsReply {
-    incidents: Vec<ApiIncident>,
-    total_count: u32,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct ApiIncident {
-    incident_id: String,
-    status: String,
-    severity: String,
-    description: Option<String>,
-    creation_time: u64,
-    modification_time: Option<u64>,
-    last_update_time: Option<u64>,
-    updated_time: Option<u64>,
-    alert_count: Option<u32>,
-    alerts: Option<Vec<ApiAlert>>,
-    hosts: Option<Vec<String>>,
-    mitre_tactics: Option<Vec<String>>,
-    mitre_techniques: Option<Vec<String>>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-struct ApiAlert {
-    alert_id: Option<String>,
-    name: Option<String>,
-    severity: Option<String>,
-    category: Option<String>,
-    source: Option<String>,
-    host_name: Option<String>,
-    endpoint_id: Option<String>,
-    description: Option<String>,
-    user_name: Option<String>,
-    action_pretty: Option<String>,
-    mitre_tactics: Option<Vec<String>>,
-    mitre_techniques: Option<Vec<String>>,
-    detection_timestamp: Option<u64>,
-}
+// ----------------------------------------------------------------------------
+// XDR Client - Main API client with caching and sync
+// ----------------------------------------------------------------------------
 
 pub struct XdrClient {
     client: Client,
     config: Config,
     debug_enabled: bool,
-
-    last_response_etag: Arc<std::sync::Mutex<Option<String>>>,
     last_successful_poll: Arc<std::sync::Mutex<Option<Instant>>>,
     consecutive_errors: Arc<AtomicU64>,
-    
+
+    // Sync cursor - stores last modification_time
+    sync_cursor: Arc<std::sync::Mutex<Option<u64>>>,
+
     // Performance caching for paginated results
-    cached_incidents: Arc<std::sync::Mutex<Option<Vec<Incident>>>>,
+    cached_cases: Arc<std::sync::Mutex<Option<Vec<Case>>>>,
     cache_timestamp: Arc<std::sync::Mutex<Option<Instant>>>,
     cache_duration: Duration,
+
+    // Stale threshold for forcing full sync (10 minutes)
+    #[allow(dead_code)]
+    stale_threshold_secs: u64,
 }
 
 impl XdrClient {
@@ -88,27 +49,33 @@ impl XdrClient {
             client: Client::new(),
             config,
             debug_enabled,
-            last_response_etag: Arc::new(std::sync::Mutex::new(None)),
             last_successful_poll: Arc::new(std::sync::Mutex::new(None)),
             consecutive_errors: Arc::new(AtomicU64::new(0)),
-            
+
+            // Sync cursor
+            sync_cursor: Arc::new(std::sync::Mutex::new(None)),
+
             // Cache configuration - 2 minutes cache duration for large paginated datasets
-            cached_incidents: Arc::new(std::sync::Mutex::new(None)),
+            cached_cases: Arc::new(std::sync::Mutex::new(None)),
             cache_timestamp: Arc::new(std::sync::Mutex::new(None)),
-            cache_duration: Duration::from_secs(120), // 2 minute cache for performance
+            cache_duration: Duration::from_secs(120),
+
+            // Force full sync if no updates for 10 minutes
+            stale_threshold_secs: 600,
         }
     }
 
-    pub async fn get_incidents(&self) -> Result<Vec<Incident>> {
+    /// Get all cases - uses cache or fetches fresh data
+    pub async fn get_cases(&self) -> Result<Vec<Case>> {
         // Check cache first to prevent unnecessary API calls
-        if let Ok(cache_guard) = self.cached_incidents.lock() {
+        if let Ok(cache_guard) = self.cached_cases.lock() {
             if let Some(ref cached) = *cache_guard {
                 if let Ok(timestamp_guard) = self.cache_timestamp.lock() {
                     if let Some(cache_time) = *timestamp_guard {
                         if cache_time.elapsed() < self.cache_duration {
                             if self.debug_enabled {
                                 self.safe_debug_log(format!(
-                                    "\n=== CACHE HIT ===\nReturning {} cached incidents\nCache age: {:?}\n=====================================",
+                                    "[CACHE] HIT - Returning {} cached cases (age: {:?})",
                                     cached.len(),
                                     cache_time.elapsed()
                                 ));
@@ -120,196 +87,203 @@ impl XdrClient {
             }
         }
 
-        // Cache miss or expired - fetch fresh data
-        let incidents = self.get_all_incidents_paginated().await?;
-        
+        if self.debug_enabled {
+            self.safe_debug_log("[SYNC] Cache miss or expired - fetching fresh data".to_string());
+        }
+
+        // Fetch all cases
+        let cases = self.get_all_cases_paginated().await?;
+
         // Update cache
-        if let Ok(mut cache_guard) = self.cached_incidents.lock() {
-            *cache_guard = Some(incidents.clone());
+        if let Ok(mut cache_guard) = self.cached_cases.lock() {
+            *cache_guard = Some(cases.clone());
         }
         if let Ok(mut timestamp_guard) = self.cache_timestamp.lock() {
             *timestamp_guard = Some(Instant::now());
         }
 
+        // Update sync cursor with latest modification time
+        if let Some(max_mod_time) = cases.iter().filter_map(|c| c.modification_time_raw).max() {
+            if let Ok(mut cursor_guard) = self.sync_cursor.lock() {
+                *cursor_guard = Some(max_mod_time);
+            }
+            if self.debug_enabled {
+                self.safe_debug_log(format!(
+                    "[SYNC] Updated cursor to modification_time: {max_mod_time}"
+                ));
+            }
+        }
+
         if self.debug_enabled {
             self.safe_debug_log(format!(
-                "\n=== CACHE UPDATED ===\nStored {} incidents in cache\n=====================================",
-                incidents.len()
+                "[CACHE] UPDATED - Stored {} cases in cache",
+                cases.len()
             ));
         }
 
-        Ok(incidents)
+        Ok(cases)
     }
 
-    /// Fetch all incidents using proper pagination to get complete dataset
-    async fn get_all_incidents_paginated(&self) -> Result<Vec<Incident>> {
+    /// Fetch all cases using proper pagination
+    async fn get_all_cases_paginated(&self) -> Result<Vec<Case>> {
         let url = format!(
-            "{}/public_api/v1/incidents/get_incidents/",
+            "{}/public_api/v1/case/search",
             self.config.tenant_url
         );
 
-        let mut all_incidents = Vec::new();
-        let mut search_from = 0;
-        let page_size = 100; // Standard page size
+        let mut all_cases = Vec::new();
+        let mut search_from: u32 = 0;
+        let page_size: u32 = 100;
         let mut dedupe_set = HashSet::new();
 
-        // Debug log pagination start
         if self.debug_enabled {
             self.safe_debug_log(format!(
-                "\n=== STARTING PAGINATED INCIDENT FETCH ===\nURL: {}\nPage Size: {}\n=====================================",
-                url, page_size
+                "[API] Starting paginated case fetch\n  URL: {url}\n  Page Size: {page_size}"
             ));
         }
 
         loop {
             let search_to = search_from + page_size;
-            
-            // Create paginated request payload
-            let mut request_data = HashMap::new();
-            request_data.insert("filters".to_string(), serde_json::json!([]));
-            request_data.insert("search_from".to_string(), serde_json::json!(search_from));
-            request_data.insert("search_to".to_string(), serde_json::json!(search_to));
-            request_data.insert("sort".to_string(), serde_json::json!({
-                "field": "modification_time",
-                "keyword": "desc"
-            }));
 
-            let request_body = GetIncidentsRequest { request_data };
+            // Create typed request payload
+            let request_data = CaseSearchRequestData::full_fetch(search_from, search_to);
+            let request_body = GetCasesRequest { request_data };
 
-            // Log POST content for debugging (only when --debug flag is enabled)
             if self.debug_enabled {
                 self.safe_debug_log(format!(
-                    "\n=== PAGINATED POST REQUEST (Page {}) ===\nURL: {}\nPOST Body: {}\nHeaders:\n  x-xdr-auth-id: {}\n  Authorization: {}...\n  Content-Type: application/json\nRange: {} - {}\n=====================================",
+                    "[API] Request page {}\n  Range: {} - {}\n  Body: {}",
                     (search_from / page_size) + 1,
-                    url,
-                    serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| "Failed to serialize".to_string()),
-                    self.config.api_key_id,
-                    if self.config.api_key_secret.len() >= 10 { 
-                        &self.config.api_key_secret[..10]
-                    } else { 
-                        &self.config.api_key_secret
-                    },
                     search_from,
-                    search_to
+                    search_to,
+                    serde_json::to_string_pretty(&request_body)
+                        .unwrap_or_else(|_| "Failed to serialise".to_string())
                 ));
             }
 
-            // Build paginated request (disable ETag caching for paginated requests)
-            let request_builder = self
+            let response = self
                 .client
                 .post(&url)
                 .header("x-xdr-auth-id", &self.config.api_key_id)
                 .header("Authorization", &self.config.api_key_secret)
                 .header("Content-Type", "application/json")
                 .timeout(Duration::from_secs(30))
-                .json(&request_body);
-
-            let response = request_builder.send().await.map_err(|e| {
-                self.consecutive_errors.fetch_add(1, Ordering::Relaxed);
-                anyhow!("Network error during pagination: {}", sanitize_error_message(&e.to_string()))
-            })?;
+                .json(&request_body)
+                .send()
+                .await
+                .map_err(|e| {
+                    self.consecutive_errors.fetch_add(1, Ordering::Relaxed);
+                    anyhow!(
+                        "Network error during pagination: {}",
+                        sanitise_error_message(&e.to_string())
+                    )
+                })?;
 
             let status = response.status();
 
-            // Handle rate limiting with exponential backoff
+            // Handle rate limiting
             if status == 429 {
                 self.consecutive_errors.fetch_add(1, Ordering::Relaxed);
-                return Err(anyhow!("Rate limit exceeded during pagination - will retry with backoff"));
+                if self.debug_enabled {
+                    self.safe_debug_log("[API] Rate limit (429) - will retry with backoff".to_string());
+                }
+                return Err(anyhow!(
+                    "Rate limit exceeded during pagination - will retry with backoff"
+                ));
             }
 
             if !status.is_success() {
                 self.consecutive_errors.fetch_add(1, Ordering::Relaxed);
-                let error_body = response.text().await.unwrap_or_else(|_| "No response body".to_string());
-                return Err(anyhow!("Paginated API request failed with status: {} - {}", status, error_body));
+                let error_body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "No response body".to_string());
+                if self.debug_enabled {
+                    self.safe_debug_log(format!(
+                        "[API] Error response\n  Status: {status}\n  Body: {error_body}"
+                    ));
+                }
+                return Err(anyhow!(
+                    "API request failed with status: {status} - {error_body}"
+                ));
             }
 
             let body = response.text().await.map_err(|e| {
                 self.consecutive_errors.fetch_add(1, Ordering::Relaxed);
-                anyhow!("Failed to read paginated response body: {}", e)
+                anyhow!("Failed to read response body: {e}")
             })?;
 
-            let response: GetIncidentsResponse = serde_json::from_str(&body).map_err(|e| {
+            let response: GetCasesResponse = serde_json::from_str(&body).map_err(|e| {
                 self.consecutive_errors.fetch_add(1, Ordering::Relaxed);
-                anyhow!("Invalid paginated response format: {}", e)
+                if self.debug_enabled {
+                    let truncated_body = &body[..body.len().min(500)];
+                    self.safe_debug_log(format!(
+                        "[API] Parse error\n  Error: {e}\n  Body: {truncated_body}"
+                    ));
+                }
+                anyhow!("Invalid response format: {e}")
             })?;
 
             let total_count = response.reply.total_count;
-            let page_incidents = response.reply.incidents;
-            
-            // Debug log pagination progress
+            let page_cases = response.reply.data;
+
             if self.debug_enabled {
                 self.safe_debug_log(format!(
-                    "\n=== PAGINATION PROGRESS ===\nPage: {}\nReceived: {} incidents\nTotal Count: {}\nRange: {} - {}\nAll Collected: {}\n=====================================",
+                    "[API] Page {} received\n  Cases: {}\n  Total count: {}\n  Collected so far: {}",
                     (search_from / page_size) + 1,
-                    page_incidents.len(),
+                    page_cases.len(),
                     total_count,
-                    search_from,
-                    search_to,
-                    all_incidents.len()
+                    all_cases.len()
                 ));
             }
 
-            // Convert and deduplicate incidents
-            for api_incident in page_incidents {
-                let incident_id = api_incident.incident_id.clone();
-                if dedupe_set.insert(incident_id) {
-                    // Only add if we haven't seen this incident_id before
-                    let incident = self.convert_incident(api_incident);
-                    all_incidents.push(incident);
+            // Convert and deduplicate cases
+            for api_case in page_cases {
+                let case_id = api_case.case_id.to_string();
+                if dedupe_set.insert(case_id) {
+                    let case = self.convert_api_case(api_case);
+                    all_cases.push(case);
                 }
             }
 
-            // Check if we've fetched all available incidents
-            if search_to >= total_count as usize {
+            // Check if we've fetched all available cases
+            if search_to >= total_count {
                 if self.debug_enabled {
                     self.safe_debug_log(format!(
-                        "\n=== PAGINATION COMPLETE ===\nTotal Incidents Fetched: {}\nUnique Incidents: {}\nAPI Total Count: {}\n=====================================",
-                        all_incidents.len() + dedupe_set.len() - all_incidents.len(), // Total fetched including dupes
-                        all_incidents.len(), // Unique count
+                        "[API] Pagination complete\n  Unique cases: {}\n  Total count: {}",
+                        all_cases.len(),
                         total_count
                     ));
                 }
                 break;
             }
 
-            // Move to next page
             search_from += page_size;
         }
 
         // Success - reset error counter
         self.consecutive_errors.store(0, Ordering::Relaxed);
-        
-        // Store timestamp for success tracking
+
         if let Ok(mut last_success) = self.last_successful_poll.lock() {
             *last_success = Some(Instant::now());
         }
 
-        if self.debug_enabled {
-            self.safe_debug_log(format!(
-                "\n=== FINAL PAGINATION RESULT ===\nTotal Unique Incidents: {}\nPages Fetched: {}\n=====================================",
-                all_incidents.len(),
-                (search_from / page_size)
-            ));
-        }
-
-        Ok(all_incidents)
+        Ok(all_cases)
     }
 
+    /// Get adaptive poll interval based on error state
     pub fn get_adaptive_poll_interval(&self) -> Duration {
         let error_count = self.consecutive_errors.load(Ordering::Relaxed);
-        
-        // Longer base interval for large paginated datasets - reduces API load
-        let base_interval = 120000; // 2 minutes base (matching cache duration)
-        
-        // Adaptive polling based on errors and success patterns
+
+        // Base interval matches cache duration
+        let base_interval = 120000; // 2 minutes
+
         let interval_ms = if error_count == 0 {
-            // Check if we've had recent successful polls for faster updates
             if let Ok(last_poll) = self.last_successful_poll.lock() {
                 if let Some(last_time) = *last_poll {
-                    if last_time.elapsed() < Duration::from_secs(600) { // 10 minutes
-                        base_interval // Use full cache duration as poll interval
+                    if last_time.elapsed() < Duration::from_secs(600) {
+                        base_interval
                     } else {
-                        base_interval * 2 // Slower when no recent activity
+                        base_interval * 2
                     }
                 } else {
                     base_interval
@@ -318,16 +292,14 @@ impl XdrClient {
                 base_interval
             }
         } else {
-            // Exponential backoff with jitter for errors
-            let backoff_multiplier = 1 << std::cmp::min(error_count, 6); // Cap at 64x
+            // Exponential backoff for errors
+            let backoff_multiplier = 1 << std::cmp::min(error_count, 6);
             let max_interval = 600000; // 10 minutes maximum
             std::cmp::min(base_interval * backoff_multiplier, max_interval)
         };
 
         Duration::from_millis(interval_ms)
     }
-
-
 
     pub fn get_poll_interval(&self) -> Duration {
         self.get_adaptive_poll_interval()
@@ -337,251 +309,294 @@ impl XdrClient {
         self.consecutive_errors.load(Ordering::Relaxed)
     }
 
-    /// Clear cache to force fresh data fetch (useful for manual refresh)
+    /// Clear cache to force fresh data fetch
+    #[allow(dead_code)]
     pub fn clear_cache(&self) {
-        if let Ok(mut cache_guard) = self.cached_incidents.lock() {
+        if let Ok(mut cache_guard) = self.cached_cases.lock() {
             *cache_guard = None;
         }
         if let Ok(mut timestamp_guard) = self.cache_timestamp.lock() {
             *timestamp_guard = None;
         }
+        if let Ok(mut cursor_guard) = self.sync_cursor.lock() {
+            *cursor_guard = None;
+        }
         if self.debug_enabled {
-            self.safe_debug_log("\n=== CACHE CLEARED ===\nForcing fresh data fetch on next request\n=====================================".to_string());
+            self.safe_debug_log("[CACHE] Cleared - forcing fresh data fetch".to_string());
         }
     }
 
-    fn convert_incident(&self, api_incident: ApiIncident) -> Incident {
-        let creation_time = DateTime::from_timestamp(api_incident.creation_time as i64 / 1000, 0)
+    /// Convert API case to domain Case structure
+    fn convert_api_case(&self, api_case: ApiCase) -> Case {
+        let creation_time = api_case.creation_time
+            .and_then(|ts| DateTime::from_timestamp(ts as i64 / 1000, 0))
             .unwrap_or_else(Utc::now);
 
-        // Check for update time fields in order of preference
-        let last_updated = api_incident.modification_time
-            .or(api_incident.last_update_time)
-            .or(api_incident.updated_time)
-            .and_then(|timestamp| DateTime::from_timestamp(timestamp as i64 / 1000, 0));
+        let modification_time_raw = api_case.modification_time;
 
-        // Convert any alerts that are included in the main response
-        let alerts: Vec<Alert> = if let Some(api_alerts) = api_incident.alerts {
-            // Only log when alerts are actually found to reduce noise
-            if !api_alerts.is_empty() {
-                eprintln!("DEBUG: Main incident response included {} alerts for incident {}", api_alerts.len(), api_incident.incident_id);
-            }
-            api_alerts.into_iter()
-                .map(|api_alert| Alert {
-                    name: api_alert.name.unwrap_or_else(|| "Unknown".to_string()),
-                    severity: api_alert.severity.unwrap_or_else(|| api_incident.severity.clone()),
-                    category: api_alert.category.unwrap_or_else(|| "Unknown".to_string()),
-                    source: api_alert.source,
-                    host_name: api_alert.host_name,
-                    description: api_alert.description,
-                    user_name: api_alert.user_name,
-                    action_pretty: api_alert.action_pretty,
-                    mitre_tactics: api_alert.mitre_tactics.unwrap_or_default(),
-                    mitre_techniques: api_alert.mitre_techniques.unwrap_or_default(),
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let last_updated = modification_time_raw
+            .and_then(|ts| DateTime::from_timestamp(ts as i64 / 1000, 0));
 
-        let mitre_tactics = api_incident.mitre_tactics.unwrap_or_default();
-        let mitre_techniques = api_incident.mitre_techniques.unwrap_or_default();
-        
-        // MITRE data processing (production ready)
+        // Extract description
+        let description = api_case.description.clone().unwrap_or_default();
 
-        // Extract description and count first to avoid borrow issues
-        let description = api_incident.description.clone().unwrap_or_else(|| "".to_string());
-        let alert_count = if let Some(api_count) = api_incident.alert_count {
-            api_count // Use API count if available
-        } else {
-            // Extract count from description if API doesn't provide it
-            if description.contains("along with") {
-                // Parse "along with X other" patterns
-                if description.contains("along with 2 other") {
-                    3 // 1 + 2 others = 3 total
-                } else if description.contains("along with 1 other") {
-                    2 // 1 + 1 other = 2 total  
-                } else if description.contains("along with") && description.contains("other") {
-                    // Try to extract number
-                    if let Some(num_str) = description.split("along with ").nth(1) {
-                        if let Some(num_part) = num_str.split(" other").next() {
-                            if let Ok(count) = num_part.trim().parse::<u32>() {
-                                count + 1 // Add 1 for the main issue
-                            } else {
-                                1 // Default fallback
-                            }
-                        } else {
-                            1
-                        }
-                    } else {
-                        1
-                    }
-                } else {
-                    1 // Single issue
-                }
-            } else {
-                1 // Default to 1 if no pattern found
-            }
-        };
-
-        Incident {
-            id: api_incident.incident_id,
-            status: api_incident.status,
-            severity: api_incident.severity,
-            description,
-            creation_time,
-            last_updated,
-            alert_count,
-            alerts,
-            // Extract MITRE ATT&CK data from main incident response
-            mitre_tactics,
-            mitre_techniques,
-        }
-    }
-
-    // Public function to get alerts for a specific incident on-demand
-    pub async fn get_incident_alerts(&self, incident_id: &str) -> Result<Vec<Alert>> {
-        
-        let url = format!(
-            "{}/public_api/v1/incidents/get_incident_extra_data/",
-            self.config.tenant_url
-        );
-
-        let request_body = serde_json::json!({
-            "request_data": {
-                "incident_id": incident_id
-            }
+        // Get issue count
+        let issue_count = api_case.issue_count.unwrap_or_else(|| {
+            api_case.issue_ids.as_ref().map(|ids| ids.len() as u32).unwrap_or(1)
         });
 
-        // Log POST content for debugging (only when --debug flag is enabled)
+        // Parse MITRE tactics from "TA0002 - Execution" format to just "Execution"
+        let mitre_tactics = api_case.mitre_tactics_ids_and_names
+            .unwrap_or_default()
+            .iter()
+            .map(|s| {
+                // Extract name after " - " if present
+                if let Some(pos) = s.find(" - ") {
+                    s[pos + 3..].to_string()
+                } else {
+                    s.clone()
+                }
+            })
+            .collect();
+
+        // Parse MITRE techniques from "T1552.007 - Unsecured Credentials: Container API" format
+        let mitre_techniques = api_case.mitre_techniques_ids_and_names
+            .unwrap_or_default()
+            .iter()
+            .map(|s| {
+                // Extract name after " - " if present
+                if let Some(pos) = s.find(" - ") {
+                    s[pos + 3..].to_string()
+                } else {
+                    s.clone()
+                }
+            })
+            .collect();
+
+        // Get hosts
+        let hosts = api_case.hosts.clone().unwrap_or_default();
+
+        // Get users
+        let users = api_case.users.clone().unwrap_or_default();
+
+        // Get status - map status_progress field
+        let status = api_case.status_progress.clone().unwrap_or_else(|| "Unknown".to_string());
+
+        // Get severity
+        let severity = api_case.severity.clone().unwrap_or_else(|| "unknown".to_string());
+
+        // Get case domain
+        let case_domain = api_case.case_domain.clone();
+
+        // Get XDR URL for quick access
+        let xdr_url = api_case.xdr_url.clone();
+
+        // Get tags
+        let tags = api_case.tags.clone().unwrap_or_default();
+
+        // Create empty issues list (populated on drill-down)
+        let issues: Vec<IssueDetail> = Vec::new();
+
         if self.debug_enabled {
             self.safe_debug_log(format!(
-                "\n=== POST CONTENT FOR INCIDENT EXTRA DATA API ===\nURL: {}\nPOST Body: {}\nHeaders:\n  x-xdr-auth-id: {}\n  Authorization: {}...\n  Content-Type: application/json\n=====================================",
-                url,
-                serde_json::to_string_pretty(&request_body).unwrap_or_else(|_| "Failed to serialize".to_string()),
-                self.config.api_key_id,
-                if self.config.api_key_secret.len() >= 10 { 
-                    &self.config.api_key_secret[..10]
-                } else { 
-                    &self.config.api_key_secret
-                }
+                "[CONVERT] Case {} -> domain: {:?}, status: {}, severity: {}, issues: {}",
+                api_case.case_id,
+                case_domain,
+                status,
+                severity,
+                issue_count
             ));
         }
 
+        Case {
+            id: api_case.case_id.to_string(),
+            status,
+            severity,
+            description,
+            creation_time,
+            last_updated,
+            modification_time_raw,
+            issue_count,
+            issues,
+            mitre_tactics,
+            mitre_techniques,
+            case_domain,
+            hosts,
+            users,
+            xdr_url,
+            tags,
+        }
+    }
 
-        
+    /// Get issues for specific case (on-demand fetch for drill-down)
+    pub async fn get_case_issues(&self, case_id: &str) -> Result<Vec<IssueDetail>> {
+        let url = format!(
+            "{}/public_api/v1/issue/search",
+            self.config.tenant_url
+        );
+
+        // Parse case_id to i64 for the API request
+        let case_id_num: i64 = case_id.parse().unwrap_or(0);
+
+        if self.debug_enabled {
+            self.safe_debug_log(format!(
+                "[API] Fetching issues for case {case_id}\n  URL: {url}"
+            ));
+        }
+
+        // Create typed request payload
+        let request_data = IssueSearchRequestData::by_case_id(case_id_num, 0, 100);
+        let request_body = GetIssuesRequest { request_data };
+
+        if self.debug_enabled {
+            self.safe_debug_log(format!(
+                "[API] Issue search request\n  Body: {}",
+                serde_json::to_string_pretty(&request_body)
+                    .unwrap_or_else(|_| "Failed to serialise".to_string())
+            ));
+        }
+
         let response = self
             .client
             .post(&url)
             .header("x-xdr-auth-id", &self.config.api_key_id)
             .header("Authorization", &self.config.api_key_secret)
             .header("Content-Type", "application/json")
-            .timeout(Duration::from_secs(8))
+            .timeout(Duration::from_secs(15))
             .json(&request_body)
             .send()
             .await
-            .map_err(|e| anyhow!("Alert request failed: {}", e))?;
-
-
+            .map_err(|e| {
+                anyhow!(
+                    "Network error fetching issues: {}",
+                    sanitise_error_message(&e.to_string())
+                )
+            })?;
 
         let status = response.status();
+
         if !status.is_success() {
-            let error_body = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(anyhow!("Alert API request failed with status: {} - {}", status, error_body));
+            let error_body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "No response body".to_string());
+            if self.debug_enabled {
+                self.safe_debug_log(format!(
+                    "[API] Issue search error\n  Status: {status}\n  Body: {error_body}"
+                ));
+            }
+            return Err(anyhow!(
+                "Issue search failed with status: {status} - {error_body}"
+            ));
         }
 
-        let response_text = response.text().await
-            .map_err(|e| anyhow!("Failed to read incident extra data response: {}", e))?;
+        let body = response.text().await.map_err(|e| {
+            anyhow!("Failed to read issue response body: {e}")
+        })?;
+
+        let response: GetIssuesResponse = serde_json::from_str(&body).map_err(|e| {
+            if self.debug_enabled {
+                let truncated_body = &body[..body.len().min(500)];
+                self.safe_debug_log(format!(
+                    "[API] Issue parse error\n  Error: {e}\n  Body: {truncated_body}"
+                ));
+            }
+            anyhow!("Invalid issue response format: {e}")
+        })?;
+
+        let api_issues = response.reply.data;
+        let total_count = response.reply.total_count.unwrap_or(api_issues.len() as u32);
+
+        if self.debug_enabled {
+            self.safe_debug_log(format!(
+                "[API] Issues received for case {case_id}\n  Count: {}\n  Total: {}",
+                api_issues.len(),
+                total_count
+            ));
+        }
+
+        // Convert API issues to domain IssueDetail structures
+        let issues: Vec<IssueDetail> = api_issues
+            .into_iter()
+            .map(|api_issue| self.convert_api_issue(api_issue))
+            .collect();
+
+        Ok(issues)
+    }
+
+    /// Convert API issue to domain IssueDetail structure
+    fn convert_api_issue(&self, api_issue: ApiIssue) -> IssueDetail {
+        let name = api_issue.name.unwrap_or_else(|| "Unknown Issue".to_string());
+        let severity = api_issue.severity.unwrap_or_else(|| "unknown".to_string());
+        let category = api_issue.category.unwrap_or_else(|| "Unknown".to_string());
         
-        // Parse the incident extra data API response
-        let extra_data_response: serde_json::Value = serde_json::from_str(&response_text)
-            .map_err(|e| anyhow!("Invalid incident extra data response format: {}", e))?;
-
-        // Extract alerts from $.reply.alerts.data
-        let alerts = if let Some(reply) = extra_data_response.get("reply") {
-            if let Some(alerts_section) = reply.get("alerts") {
-                if let Some(alerts_data) = alerts_section.get("data") {
-                    if let Some(alerts_array) = alerts_data.as_array() {
-                    let alerts: Vec<_> = alerts_array
-                        .iter()
-                        .map(|alert_value| Alert {
-                            name: alert_value.get("name").and_then(|v| v.as_str()).unwrap_or("Unknown Alert").to_string(),
-                            severity: alert_value.get("severity").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
-                            category: alert_value.get("category").and_then(|v| v.as_str()).unwrap_or("Unknown").to_string(),
-                            source: alert_value.get("source").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                            host_name: alert_value.get("host_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                            description: alert_value.get("description").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                            user_name: alert_value.get("user_name").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                            action_pretty: alert_value.get("action_pretty").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                            mitre_tactics: alert_value.get("mitre_tactic_id_and_name")
-                                .and_then(|v| v.as_str())
-                                .map(|s| vec![s.to_string()])
-                                .unwrap_or_default(),
-                            mitre_techniques: alert_value.get("mitre_technique_id_and_name")
-                                .and_then(|v| v.as_str())
-                                .map(|s| vec![s.to_string()])
-                                .unwrap_or_default(),
-                        })
-                        .collect();
-
-                        alerts
-                    } else {
-                        Vec::new()
-                    }
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        };
-        Ok(alerts)
-    }
-
-    /// Safe debug logging helper with proper resource management
-    fn safe_debug_log(&self, message: String) {
-        if !self.debug_enabled {
-            return;
+        if self.debug_enabled {
+            self.safe_debug_log(format!(
+                "[CONVERT] Issue -> name: {}, severity: {}, category: {}, assets: {:?}",
+                name, severity, category, api_issue.asset_names
+            ));
         }
-
-        // Use a separate task to handle file I/O with timeout to prevent blocking
-        let _ = std::thread::spawn(move || {
-            let timeout_duration = std::time::Duration::from_millis(500);
-            let start = std::time::Instant::now();
-            
-            match std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open("debug_output.log") {
-                Ok(mut file) => {
-                    if start.elapsed() < timeout_duration {
-                        let _ = writeln!(file, "{}", message);
-                        let _ = file.flush(); // Ensure data is written
-                    }
-                }
-                Err(_) => {
-                    // Silent fail - don't let logging errors affect main operation
-                }
-            }
-        });
+        
+        IssueDetail {
+            name,
+            severity,
+            category,
+            domain: api_issue.domain,
+            description: api_issue.description,
+            remediation: api_issue.remediation,
+            asset_names: api_issue.asset_names.unwrap_or_default(),
+            detection_method: api_issue.detection_method,
+            tags: api_issue.tags.unwrap_or_default(),
+        }
     }
 
+    /// Safe debug logging with file output
+    fn safe_debug_log(&self, message: String) {
+        let timeout_duration = std::time::Duration::from_millis(500);
+        let start = std::time::Instant::now();
 
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("debug_output.log")
+        {
+            if start.elapsed() < timeout_duration {
+                let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+                let _ = writeln!(file, "[{timestamp}] {message}");
+                let _ = file.flush();
+            }
+        }
+    }
 }
 
-// Sanitize error messages to prevent sensitive information leakage
-fn sanitize_error_message(error_msg: &str) -> String {
-    // Remove potential sensitive information like URLs, auth headers, etc.
-    let sanitized = error_msg
-        .replace(&std::env::var("API_KEY").unwrap_or_default(), "***")
-        .replace(&std::env::var("API_SECRET").unwrap_or_default(), "***");
-    
-    // Truncate very long error messages
-    if sanitized.len() > 200 {
-        format!("{}...", &sanitized[..200])
-    } else {
-        sanitized
+
+// ----------------------------------------------------------------------------
+// Helper Functions
+// ----------------------------------------------------------------------------
+
+/// Sanitise error messages to remove sensitive information
+fn sanitise_error_message(error: &str) -> String {
+    let mut sanitised = error.to_string();
+
+    // Remove API keys and tokens
+    if let Some(start) = sanitised.find("Authorization:") {
+        if let Some(end) = sanitised[start..].find('\n') {
+            sanitised.replace_range(start..start + end, "Authorization: [REDACTED]");
+        }
     }
+
+    // Remove URLs with credentials
+    let patterns = ["api_key=", "token=", "secret="];
+    for pattern in patterns {
+        while let Some(start) = sanitised.find(pattern) {
+            if let Some(end) = sanitised[start..].find(['&', ' ', '\n']) {
+                sanitised.replace_range(start..start + end, &format!("{pattern}[REDACTED]"));
+            } else {
+                sanitised.replace_range(start.., &format!("{pattern}[REDACTED]"));
+                break;
+            }
+        }
+    }
+
+    sanitised
 }

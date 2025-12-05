@@ -11,18 +11,19 @@ use tokio::time::{interval, Duration};
 
 mod api;
 mod config;
-mod incidents;
+mod cases;
+mod types;
 mod ui;
 
 use api::XdrClient;
 use config::Config;
-use incidents::IncidentStore;
+use cases::CaseStore;
 use ui::App;
 
 #[derive(Parser)]
 #[command(name = "xdrtop")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
-#[command(about = "XDRTop - A CLI tool to monitor Cortex XDR incidents in real-time")]
+#[command(about = "XDRTop - A CLI tool to monitor Cortex XDR cases in real-time")]
 struct Cli {
     /// Initialise configuration
     #[arg(long)]
@@ -50,8 +51,8 @@ async fn main() -> Result<()> {
     let debug_enabled = cli.debug;
 
     if cli.test_api {
-        match client.get_incidents().await {
-            Ok(_incidents) => {
+        match client.get_cases().await {
+            Ok(_cases) => {
             }
             Err(_e) => {
             }
@@ -59,7 +60,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let mut incident_store = IncidentStore::new();
+    let mut case_store = CaseStore::new();
     let mut app = App::new();
     
     // Set tenant URL for display
@@ -68,7 +69,7 @@ async fn main() -> Result<()> {
     // Setup terminal - disable mouse capture to allow text selection
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?; // Removed EnableMouseCapture
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -80,14 +81,14 @@ async fn main() -> Result<()> {
     );
     app.set_filter_settings(severity_filter, status_filter);
 
-    let result = run_app(&mut terminal, &mut app, &client, &mut incident_store, &mut config, debug_enabled).await;
+    let result = run_app(&mut terminal, &mut app, &client, &mut case_store, &mut config, debug_enabled).await;
 
-    // Restore terminal - no need to disable mouse capture since we didn't enable it
+    // Restore terminal
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen
-    )?; // Removed DisableMouseCapture
+    )?;
     terminal.show_cursor()?;
 
     if let Err(_err) = result {
@@ -100,7 +101,7 @@ async fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     client: &XdrClient,
-    incident_store: &mut IncidentStore,
+    case_store: &mut CaseStore,
     config: &mut Config,
     debug_enabled: bool,
 ) -> Result<()> {
@@ -119,20 +120,20 @@ async fn run_app<B: ratatui::backend::Backend>(
     loop {
         tokio::select! {
             _ = poll_interval.tick() => {
-                // Poll for incidents with improved error handling
-                match client.get_incidents().await {
-                    Ok(incidents) => {
+                // Poll for cases with improved error handling
+                match client.get_cases().await {
+                    Ok(cases) => {
                         app.record_api_call();
                         
                         // Only update if we have new data (empty vec indicates 304 Not Modified)
-                        if !incidents.is_empty() {
-                            incident_store.update(incidents);
-                            app.set_incidents(incident_store.get_all());
+                        if !cases.is_empty() {
+                            case_store.update(cases);
+                            app.set_cases(case_store.get_all());
                         }
                         
                         let error_count = client.get_error_count();
                         let status_msg = if error_count > 0 {
-                            format!("Connected (recovered from {} errors)", error_count)
+                            format!("Connected (recovered from {error_count} errors)")
                         } else {
                             "Connected".to_string()
                         };
@@ -151,7 +152,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     Err(_e) => {
                         app.record_api_call();
                         let error_count = client.get_error_count();
-                        let status_msg = format!("Connection error (attempt {})", error_count);
+                        let status_msg = format!("Connection error (attempt {error_count})");
                         app.set_status(status_msg, true);
 
                         // Adaptive polling with exponential backoff
@@ -163,7 +164,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                             if error_count > 3 {
                                 let backoff_seconds = new_interval.as_secs();
                                 app.set_status(
-                                    format!("Multiple errors. Backing off to {}s", backoff_seconds),
+                                    format!("Multiple errors. Backing off to {backoff_seconds}s"),
                                     true
                                 );
                             }
@@ -193,9 +194,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                             KeyCode::Char('q') => {
                                 // Save filter settings before exiting
                                 let (severity_filter, status_filter) = app.get_filter_settings();
-                                if let Err(_) = config.update_filter_settings(severity_filter, status_filter).await {
-                                    // If saving fails, continue exiting anyway
-                                }
+                                let _ = config.update_filter_settings(severity_filter, status_filter).await;
                                 should_exit = true;
                             }
                             KeyCode::Esc | KeyCode::Backspace => {
@@ -208,12 +207,12 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 // Prevent accidental Enter activation during startup on Windows
                                 if startup_time.elapsed().as_millis() > 500 && 
                                    !app.is_drill_down_mode() && 
-                                   !app.filtered_incidents.is_empty() {
+                                   !app.filtered_cases.is_empty() {
                                     
-                                    // Get incident ID BEFORE entering drill-down mode
-                                    let incident_id = if let Some(selected_idx) = app.table_state.selected() {
-                                        if selected_idx < app.filtered_incidents.len() {
-                                            let id = app.filtered_incidents[selected_idx].id.clone();
+                                    // Get case ID BEFORE entering drill-down mode
+                                    let case_id = if let Some(selected_idx) = app.table_state.selected() {
+                                        if selected_idx < app.filtered_cases.len() {
+                                            let id = app.filtered_cases[selected_idx].id.clone();
 
                                             Some(id)
                                         } else {
@@ -225,58 +224,56 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         None
                                     };
                                     
-                                    // Fetch alert details FIRST, then enter drill-down with complete data
-                                    if let Some(id) = incident_id {
+                                    // Fetch issue details FIRST, then enter drill-down with complete data
+                                    if let Some(id) = case_id {
 
                                         // Show immediate loading indicator before any operations
-                                        app.set_status("⏳ Loading issue details - please wait...".to_string(), false);
+                                        app.set_status("[LOADING] Issue details - please wait...".to_string(), false);
                                         
                                         // Force UI update to show loading message immediately
                                         terminal.draw(|f| ui::draw(f, app))?;
                                         
-                                        // Prepare for drill-down and fetch alert details
+                                        // Prepare for drill-down and fetch issue details
                                         app.prepare_for_drill_down(&id);
                                         app.enter_drill_down();
                                         
                                         // Log drill-down attempt for debugging (only when --debug flag is enabled)
                                         if debug_enabled {
+                                            let now = std::time::SystemTime::now();
                                             safe_debug_log(format!(
-                                                "\n=== DRILL-DOWN ATTEMPT FOR INCIDENT {} ===\nTime: {:?}",
-                                                id, std::time::SystemTime::now()
+                                                "\n=== DRILL-DOWN ATTEMPT FOR CASE {id} ===\nTime: {now:?}"
                                             ));
                                         }
                                         
-                                        // Fetch alerts for this incident with timeout
-                                        let alert_fetch_timeout = tokio::time::Duration::from_secs(10);
-                                        match tokio::time::timeout(alert_fetch_timeout, client.get_incident_alerts(&id)).await {
-                                            Ok(Ok(alerts)) => {
+                                        // Fetch issues for this case with timeout
+                                        let issue_fetch_timeout = tokio::time::Duration::from_secs(10);
+                                        match tokio::time::timeout(issue_fetch_timeout, client.get_case_issues(&id)).await {
+                                            Ok(Ok(issues)) => {
                                                 if debug_enabled {
+                                                    let issue_count = issues.len();
                                                     safe_debug_log(format!(
-                                                        "SUCCESS: Fetched {} alerts for incident {}", 
-                                                        alerts.len(), id
+                                                        "SUCCESS: Fetched {issue_count} issues for case {id}"
                                                     ));
                                                 }
-                                                app.update_selected_incident_alerts(alerts.clone());
-                                                app.set_status(format!("✅ Loaded {} issue details", alerts.len()), false);
+                                                let loaded_count = issues.len();
+                                                app.update_selected_case_issues(issues.clone());
+                                                app.set_status(format!("[OK] Loaded {loaded_count} issue details"), false);
                                             }
                                             Ok(Err(e)) => {
                                                 if debug_enabled {
                                                     safe_debug_log(format!(
-                                                        "ERROR: Alert API failed for incident {}: {}", 
-                                                        id, e
+                                                        "ERROR: Issue API failed for case {id}: {e}"
                                                     ));
                                                 }
-                                                app.set_status(format!("Alert API error: {}", e), true);
+                                                app.set_status(format!("Issue API error: {e}"), true);
                                             }
                                             Err(_timeout) => {
-                                                app.set_status("⏰ Alert loading timed out after 10s".to_string(), true);
+                                                app.set_status("[TIMEOUT] Issue loading timed out after 10s".to_string(), true);
                                                 if debug_enabled {
-                                                    safe_debug_log(format!("TIMEOUT: Alert fetch timed out for incident {}", id));
+                                                    safe_debug_log(format!("TIMEOUT: Issue fetch timed out for case {id}"));
                                                 }
                                             }
                                         }
-                                    } else {
-
                                     }
                                 }
                             }
@@ -320,6 +317,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     app.clear_filters();
                                 }
                             }
+                            KeyCode::Char('d') => {
+                                if !app.is_drill_down_mode() {
+                                    app.cycle_domain_filter();
+                                }
+                            }
 
                             _ => {}
                         }
@@ -352,8 +354,8 @@ fn safe_debug_log(message: String) {
             .open("debug_output.log") {
             Ok(mut file) => {
                 if start.elapsed() < timeout_duration {
-                    let _ = writeln!(file, "{}", message);
-                    let _ = file.flush(); // Ensure data is written
+                    let _ = writeln!(file, "{message}");
+                    let _ = file.flush();
                 }
             }
             Err(_) => {
