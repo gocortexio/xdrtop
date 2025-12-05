@@ -1,6 +1,6 @@
 // XDRTop API Module
 // Cortex XDR Cases and Issues API client with typed requests, incremental sync, and intelligent caching
-// Version 2.0.1 - Complete terminology migration to Cases/Issues
+// Version 2.0.4 - Fixed drill-down issue fetch using issue_ids filter
 // Following British English conventions throughout
 
 use anyhow::{anyhow, Result};
@@ -408,6 +408,9 @@ impl XdrClient {
             ));
         }
 
+        // Preserve issue_ids for drill-down fetching
+        let issue_ids = api_case.issue_ids.clone();
+
         Case {
             id: api_case.case_id.to_string(),
             status,
@@ -417,6 +420,7 @@ impl XdrClient {
             last_updated,
             modification_time_raw,
             issue_count,
+            issue_ids,
             issues,
             mitre_tactics,
             mitre_techniques,
@@ -428,24 +432,37 @@ impl XdrClient {
         }
     }
 
-    /// Get issues for specific case (on-demand fetch for drill-down)
-    pub async fn get_case_issues(&self, case_id: &str) -> Result<Vec<IssueDetail>> {
+    /// Get issues for specific case by issue IDs (on-demand fetch for drill-down)
+    /// Uses issue_ids from the Cases API response to filter by 'id' field
+    pub async fn get_case_issues(&self, case_id: &str, issue_ids: Option<&[i64]>) -> Result<Vec<IssueDetail>> {
         let url = format!(
             "{}/public_api/v1/issue/search",
             self.config.tenant_url
         );
 
-        // Parse case_id to i64 for the API request
-        let case_id_num: i64 = case_id.parse().unwrap_or(0);
+        // Check if we have issue_ids to filter by
+        let issue_ids_slice = match issue_ids {
+            Some(ids) if !ids.is_empty() => ids,
+            _ => {
+                if self.debug_enabled {
+                    self.safe_debug_log(format!(
+                        "[API] No issue_ids available for case {case_id} - cannot fetch issue details"
+                    ));
+                }
+                return Ok(Vec::new());
+            }
+        };
 
         if self.debug_enabled {
             self.safe_debug_log(format!(
-                "[API] Fetching issues for case {case_id}\n  URL: {url}"
+                "[API] Fetching {} issues for case {case_id}\n  URL: {url}\n  Issue IDs: {:?}",
+                issue_ids_slice.len(),
+                issue_ids_slice
             ));
         }
 
-        // Create typed request payload
-        let request_data = IssueSearchRequestData::by_case_id(case_id_num, 0, 100);
+        // Create typed request payload using issue IDs filter
+        let request_data = IssueSearchRequestData::by_issue_ids(issue_ids_slice, 0, 100);
         let request_body = GetIssuesRequest { request_data };
 
         if self.debug_enabled {

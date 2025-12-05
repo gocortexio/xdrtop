@@ -1,6 +1,6 @@
 // XDRTop Cases Module
 // Core data structures for case and issue management
-// Version 2.0.1 - Complete terminology migration to Cases/Issues
+// Version 2.0.4 - Fixed drill-down issue fetch using issue_ids filter
 // Following British English conventions throughout
 
 use chrono::{DateTime, Utc};
@@ -41,6 +41,7 @@ pub struct Case {
     pub last_updated: Option<DateTime<Utc>>,
     pub modification_time_raw: Option<u64>,
     pub issue_count: u32,
+    pub issue_ids: Option<Vec<i64>>,
     pub issues: Vec<IssueDetail>,
     pub mitre_tactics: Vec<String>,
     pub mitre_techniques: Vec<String>,
@@ -291,6 +292,7 @@ mod tests {
             last_updated: None,
             modification_time_raw: Some(1234567890),
             issue_count: 1,
+            issue_ids: Some(vec![1]),
             issues: Vec::new(),
             mitre_tactics: Vec::new(),
             mitre_techniques: Vec::new(),

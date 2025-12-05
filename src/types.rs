@@ -1,7 +1,7 @@
 // XDRTop Types Module
 // Strongly-typed enums and structs for Cortex XDR Cases and Issues API interactions
 // Following British English conventions throughout
-// Version 2.0.1 - Complete terminology migration to Cases/Issues
+// Version 2.0.4 - Fixed drill-down issue fetch using issue_ids filter
 
 #![allow(dead_code)]
 
@@ -397,14 +397,24 @@ pub struct IssueFilter {
 }
 
 impl IssueSearchRequestData {
-    /// Create request for fetching issues by case_id
-    pub fn by_case_id(case_id: i64, search_from: u32, search_to: u32) -> Self {
+    /// Create request for fetching issues by issue IDs
+    /// Uses the 'id' filter field with 'in' operator as case_id is not a valid filter field
+    pub fn by_issue_ids(issue_ids: &[i64], search_from: u32, search_to: u32) -> Self {
         IssueSearchRequestData {
             filters: vec![IssueFilter {
-                field: "case_id".to_string(),
-                operator: "eq".to_string(),
-                value: serde_json::json!(case_id),
+                field: "id".to_string(),
+                operator: "in".to_string(),
+                value: serde_json::json!(issue_ids),
             }],
+            search_from,
+            search_to,
+        }
+    }
+
+    /// Create request for fetching all issues (no filter)
+    pub fn all_issues(search_from: u32, search_to: u32) -> Self {
+        IssueSearchRequestData {
+            filters: Vec::new(),
             search_from,
             search_to,
         }

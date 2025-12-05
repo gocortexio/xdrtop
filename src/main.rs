@@ -209,23 +209,20 @@ async fn run_app<B: ratatui::backend::Backend>(
                                    !app.is_drill_down_mode() && 
                                    !app.filtered_cases.is_empty() {
                                     
-                                    // Get case ID BEFORE entering drill-down mode
-                                    let case_id = if let Some(selected_idx) = app.table_state.selected() {
+                                    // Get case ID and issue_ids BEFORE entering drill-down mode
+                                    let case_info = if let Some(selected_idx) = app.table_state.selected() {
                                         if selected_idx < app.filtered_cases.len() {
-                                            let id = app.filtered_cases[selected_idx].id.clone();
-
-                                            Some(id)
+                                            let case = &app.filtered_cases[selected_idx];
+                                            Some((case.id.clone(), case.issue_ids.clone()))
                                         } else {
-
                                             None
                                         }
                                     } else {
-
                                         None
                                     };
                                     
                                     // Fetch issue details FIRST, then enter drill-down with complete data
-                                    if let Some(id) = case_id {
+                                    if let Some((id, issue_ids)) = case_info {
 
                                         // Show immediate loading indicator before any operations
                                         app.set_status("[LOADING] Issue details - please wait...".to_string(), false);
@@ -241,13 +238,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         if debug_enabled {
                                             let now = std::time::SystemTime::now();
                                             safe_debug_log(format!(
-                                                "\n=== DRILL-DOWN ATTEMPT FOR CASE {id} ===\nTime: {now:?}"
+                                                "\n=== DRILL-DOWN ATTEMPT FOR CASE {id} ===\nTime: {now:?}\nIssue IDs: {issue_ids:?}"
                                             ));
                                         }
                                         
-                                        // Fetch issues for this case with timeout
+                                        // Fetch issues for this case with timeout using issue_ids
                                         let issue_fetch_timeout = tokio::time::Duration::from_secs(10);
-                                        match tokio::time::timeout(issue_fetch_timeout, client.get_case_issues(&id)).await {
+                                        let issue_ids_ref = issue_ids.as_deref();
+                                        match tokio::time::timeout(issue_fetch_timeout, client.get_case_issues(&id, issue_ids_ref)).await {
                                             Ok(Ok(issues)) => {
                                                 if debug_enabled {
                                                     let issue_count = issues.len();
