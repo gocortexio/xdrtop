@@ -35,6 +35,10 @@ struct Cli {
     /// Test API connection and show response
     #[arg(long)]
     test_api: bool,
+
+    /// Include all domains including Posture (by default only Security is shown)
+    #[arg(long)]
+    domain_all: bool,
 }
 
 #[tokio::main]
@@ -47,7 +51,7 @@ async fn main() -> Result<()> {
     }
 
     let mut config = Config::load().await?;
-    let client = XdrClient::new(config.clone(), cli.debug);
+    let client = XdrClient::new(config.clone(), cli.debug, cli.domain_all);
     let debug_enabled = cli.debug;
 
     if cli.test_api {

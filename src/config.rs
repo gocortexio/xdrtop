@@ -22,7 +22,7 @@ pub struct FilterSettings {
 
 impl Config {
     pub async fn load() -> Result<Self> {
-        // First try to load from environment variables (Replit secrets)
+        // First try to load from environment variables
         if let Ok(config) = Self::from_env() {
             return Ok(config);
         }
@@ -42,7 +42,7 @@ impl Config {
         Ok(config)
     }
 
-    /// Load configuration from environment variables (for Replit deployment)
+    /// Load configuration from environment variables
     fn from_env() -> Result<Self> {
         let api_key_id = std::env::var("XDR_API_KEY_ID")
             .map_err(|_| anyhow!("XDR_API_KEY_ID not set"))?;
@@ -115,7 +115,7 @@ pub async fn init_config() -> Result<()> {
     };
 
     config.save().await?;
-    println!("Configuration saved successfully!");
+    println!("Configuration saved.");
     Ok(())
 }
 

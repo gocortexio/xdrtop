@@ -1,7 +1,5 @@
 // XDRTop API Module
-// Cortex XDR Cases and Issues API client with typed requests, incremental sync, and intelligent caching
-// Version 2.0.4 - Fixed drill-down issue fetch using issue_ids filter
-// Following British English conventions throughout
+// Cortex XDR Cases and Issues API client
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
@@ -41,10 +39,13 @@ pub struct XdrClient {
     // Stale threshold for forcing full sync (10 minutes)
     #[allow(dead_code)]
     stale_threshold_secs: u64,
+
+    // Domain filtering - when false, excludes Posture domain (shows only Security)
+    include_all_domains: bool,
 }
 
 impl XdrClient {
-    pub fn new(config: Config, debug_enabled: bool) -> Self {
+    pub fn new(config: Config, debug_enabled: bool, include_all_domains: bool) -> Self {
         Self {
             client: Client::new(),
             config,
@@ -62,6 +63,9 @@ impl XdrClient {
 
             // Force full sync if no updates for 10 minutes
             stale_threshold_secs: 600,
+
+            // Domain filtering configuration
+            include_all_domains,
         }
     }
 
@@ -143,10 +147,21 @@ impl XdrClient {
         }
 
         loop {
-            let search_to = search_from + page_size;
+            let search_to = search_from + page_size - 1;
 
-            // Create typed request payload
-            let request_data = CaseSearchRequestData::full_fetch(search_from, search_to);
+            // Create typed request payload with domain filter based on configuration
+            // When include_all_domains is false (default), filter to Security domain only
+            let request_data = if self.include_all_domains {
+                if self.debug_enabled {
+                    self.safe_debug_log("[FILTER] Including all domains (--domain-all enabled)".to_string());
+                }
+                CaseSearchRequestData::full_fetch(search_from, search_to)
+            } else {
+                if self.debug_enabled {
+                    self.safe_debug_log("[FILTER] Filtering to Security domain only (excluding Posture)".to_string());
+                }
+                CaseSearchRequestData::with_domain_filter(vec!["Security".to_string()], search_from, search_to)
+            };
             let request_body = GetCasesRequest { request_data };
 
             if self.debug_enabled {
@@ -225,12 +240,13 @@ impl XdrClient {
 
             let total_count = response.reply.total_count;
             let page_cases = response.reply.data;
+            let page_case_count = page_cases.len() as u32;
 
             if self.debug_enabled {
                 self.safe_debug_log(format!(
-                    "[API] Page {} received\n  Cases: {}\n  Total count: {}\n  Collected so far: {}",
+                    "[API] Page {} received\n  Cases: {}\n  Total count (unfiltered): {}\n  Collected so far: {}",
                     (search_from / page_size) + 1,
-                    page_cases.len(),
+                    page_case_count,
                     total_count,
                     all_cases.len()
                 ));
@@ -245,13 +261,16 @@ impl XdrClient {
                 }
             }
 
-            // Check if we've fetched all available cases
-            if search_to >= total_count {
+            // Stop pagination when page returns fewer cases than requested
+            // This indicates we've exhausted the filtered results
+            // Note: total_count from API is unfiltered, so we cannot rely on it
+            if page_case_count < page_size {
                 if self.debug_enabled {
                     self.safe_debug_log(format!(
-                        "[API] Pagination complete\n  Unique cases: {}\n  Total count: {}",
-                        all_cases.len(),
-                        total_count
+                        "[API] Pagination complete (last page had {} cases, less than page size {})\n  Unique cases fetched: {}",
+                        page_case_count,
+                        page_size,
+                        all_cases.len()
                     ));
                 }
                 break;

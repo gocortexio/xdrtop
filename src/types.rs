@@ -1,7 +1,7 @@
 // XDRTop Types Module
 // Strongly-typed enums and structs for Cortex XDR Cases and Issues API interactions
 // Following British English conventions throughout
-// Version 2.0.4 - Fixed drill-down issue fetch using issue_ids filter
+// Version 2.1.0 - Added domain filtering to exclude Posture cases by default
 
 #![allow(dead_code)]
 
@@ -258,6 +258,34 @@ impl CaseSearchRequestData {
             search_to,
             sort: CaseSortConfig::default(),
         }
+    }
+
+    /// Create request filtered to specific domains using case_domain field with 'in' operator
+    /// Known domains: "Security", "Posture"
+    pub fn with_domain_filter(domains: Vec<String>, search_from: u32, search_to: u32) -> Self {
+        CaseSearchRequestData {
+            filters: vec![CaseFilter {
+                field: CaseFilterField::CaseDomain,
+                operator: CaseFilterOperator::In,
+                value: serde_json::json!(domains),
+            }],
+            search_from,
+            search_to,
+            sort: CaseSortConfig::default(),
+        }
+    }
+
+    /// Create request excluding a specific domain by filtering to all other known domains
+    /// To exclude "Posture", we filter to ["Security"] since these are the only two known domains
+    pub fn excluding_domain(excluded_domain: &str, search_from: u32, search_to: u32) -> Self {
+        let known_domains = vec!["Security", "Posture"];
+        let included_domains: Vec<String> = known_domains
+            .into_iter()
+            .filter(|d| *d != excluded_domain)
+            .map(|d| d.to_string())
+            .collect();
+
+        Self::with_domain_filter(included_domains, search_from, search_to)
     }
 }
 
